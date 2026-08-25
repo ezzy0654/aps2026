@@ -36,7 +36,7 @@
 | shared-staged LayerNorm | 1024 | 6.390456 | 160.238964 | PASSED |
 | + attention query reuse | 1024 | 6.328247 | 161.814155 | PASSED |
 
-최종 제출 결과:
+LayerNorm/attention 단계 제출 결과:
 
 - elapsed: 6.330615초
 - throughput: 161.753638 seq/s
@@ -57,3 +57,47 @@ make -B
 ./run.sh -n 1024 -v -o /tmp/project_final.bin
 ./submit.sh --no-update -n 1024
 ```
+
+## GEMM blockDim/gridDim sweep
+
+- register-blocked GEMM을 block/tile 상수로 일반화해 같은 FP32 K 누적을 유지했다.
+- K tile은 기존 최선인 32로 고정하고 block shape와 output tile만 비교했다.
+- n=64는 후보 선별용이며 최종 판단은 반드시 n=1024 결과로 했다.
+
+| blockDim | output tile | n=64 시간(초) | 판정 |
+|---|---|---:|---|
+| 16x16 | 64x64 | 0.719589 | 기준 |
+| 32x8 | 64x64 | 0.725352 | n=1024 재검증 |
+| 8x32 | 64x64 | 1.002306 | 폐기 |
+| 64x4 | 64x64 | 0.831598 | 폐기 |
+| 32x16 | 64x64 | 0.708689 | n=1024 재검증 |
+| 16x16 | 32x64 | 0.721336 | 폐기 |
+| 16x16 | 64x32 | 0.682106 | n=1024 재검증 |
+| 16x16 | 64x128 | 1.029087 | 폐기 |
+| 16x16 | 128x64 | 0.866013 | 폐기 |
+
+n=1024 finalist 결과:
+
+| blockDim | output tile | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---|---:|---:|---|
+| 16x16 | 64x64 | 6.330615 | 161.753638 | PASSED |
+| 32x8 | 64x64 | 6.273929 | 163.215117 | PASSED |
+| 32x8 반복 | 64x64 | 6.245893 | 163.947731 | PASSED |
+| 32x16 | 64x64 | 6.705722 | 152.705403 | PASSED |
+| 16x16 | 64x32 | 7.200540 | 142.211552 | PASSED |
+
+선택한 geometry:
+
+- blockDim: `(32, 8)` = 256 threads
+- output tile: `64x64`, K tile: `32`
+- gridDim: `(ceil(N/64), ceil(M/64))`
+- thread당 output: `8x2`, accumulator 16개
+
+최종 제출 결과:
+
+- elapsed: 6.273657초
+- throughput: 163.222190 seq/s
+- validation max abs diff: 0.0045929
+- validation mean abs diff: 1.3264e-05
+- 직전 개인 최고 대비: +0.9%
+- 제출 시점 순위: 2위 / 8명

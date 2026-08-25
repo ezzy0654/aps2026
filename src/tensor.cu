@@ -393,6 +393,10 @@ __global__ void k_matmul_transposed_tiled(const float* __restrict__ a, const flo
 constexpr int BIG_BM = 64;
 constexpr int BIG_BN = 64;
 constexpr int BIG_BK = 32;
+constexpr int BIG_BX = 32;
+constexpr int BIG_BY = 8;
+constexpr int BIG_TM = BIG_BM / BIG_BY;
+constexpr int BIG_TN = BIG_BN / BIG_BX;
 
 __global__ void k_matmul_transposed_register_blocked(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -402,15 +406,15 @@ __global__ void k_matmul_transposed_register_blocked(
     __shared__ float Bs[BIG_BN][BIG_BK + 1];
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    const int tid = ty * blockDim.x + tx;
+    const int tid = ty * BIG_BX + tx;
     const std::size_t row0 =
-        static_cast<std::size_t>(blockIdx.y) * BIG_BM + ty * 4;
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM + ty * BIG_TM;
     const std::size_t col0 =
-        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * 4;
-    float acc[4][4] = {};
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * BIG_TN;
+    float acc[BIG_TM][BIG_TN] = {};
 
     for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
-        for (int idx = tid; idx < BIG_BM * BIG_BK; idx += 256) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK; idx += BIG_BX * BIG_BY) {
             const int lr = idx / BIG_BK;
             const int lp = idx % BIG_BK;
             const std::size_t row =
@@ -418,7 +422,7 @@ __global__ void k_matmul_transposed_register_blocked(
             const std::size_t p = p0 + lp;
             As[lr][lp] = row < m && p < k ? a[row * k + p] : 0.0f;
         }
-        for (int idx = tid; idx < BIG_BN * BIG_BK; idx += 256) {
+        for (int idx = tid; idx < BIG_BN * BIG_BK; idx += BIG_BX * BIG_BY) {
             const int lc = idx / BIG_BK;
             const int lp = idx % BIG_BK;
             const std::size_t col =
@@ -430,19 +434,19 @@ __global__ void k_matmul_transposed_register_blocked(
 #pragma unroll
         for (int p = 0; p < BIG_BK; ++p) {
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const float av = As[ty * 4 + r][p];
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
 #pragma unroll
-                for (int cc = 0; cc < 4; ++cc)
-                    acc[r][cc] += av * Bs[tx * 4 + cc][p];
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
             }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int r = 0; r < 4; ++r)
+    for (int r = 0; r < BIG_TM; ++r)
 #pragma unroll
-        for (int cc = 0; cc < 4; ++cc) {
+        for (int cc = 0; cc < BIG_TN; ++cc) {
             const std::size_t row = row0 + r;
             const std::size_t col = col0 + cc;
             if (row < m && col < n) c[row * n + col] = acc[r][cc];
@@ -742,7 +746,7 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
     const float* db = b.cuda_data();
     float* dc = c.cuda_data_write();
     if (m >= BIG_BM && n >= BIG_BN) {
-        const dim3 block(16, 16);
+        const dim3 block(BIG_BX, BIG_BY);
         const dim3 grid(
             static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
             static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
