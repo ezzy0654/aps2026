@@ -850,6 +850,100 @@ __global__ void k_attention(
     }
 }
 
+// Phi GQA has four query heads per KV head. Group those query heads in one
+// block so each key vector and value vector is fetched once instead of four
+// times. The reduction order within every individual head remains d=0..127
+// for QK and key=0..window-1 for the weighted value sum.
+__global__ void k_attention_grouped_gqa4(
+    const float* q, const float* k, const float* v, float* out,
+    const std::uint32_t* seg_offset, const std::uint32_t* seg_pos,
+    std::size_t rows, std::size_t q_heads, std::size_t kv_heads,
+    std::size_t head_dim, std::size_t max_seq) {
+    constexpr std::size_t group = 4;
+    const std::size_t task = blockIdx.x;
+    const std::size_t row = task / kv_heads;
+    const std::size_t kh = task % kv_heads;
+    if (row >= rows) return;
+    const std::size_t pos = seg_pos[row];
+    const std::size_t begin =
+        pos + 1 > apss26::SLIDING_WINDOW
+            ? pos + 1 - apss26::SLIDING_WINDOW : 0;
+    const std::size_t window = pos - begin + 1;
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* queries = scores + group * max_seq;
+    float* key = queries + group * head_dim;
+    const std::size_t qh0 = kh * group;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    for (std::size_t i = threadIdx.x; i < group * head_dim;
+         i += blockDim.x) {
+        const std::size_t g = i / head_dim;
+        const std::size_t d = i % head_dim;
+        const std::size_t qbase = (row * q_heads + qh0 + g) * head_dim;
+        queries[i] = q[qbase + d];
+    }
+    __syncthreads();
+
+    for (std::size_t w = 0; w < window; ++w) {
+        const std::size_t key_row =
+            static_cast<std::size_t>(seg_offset[row]) + begin + w;
+        const std::size_t kbase = (key_row * kv_heads + kh) * head_dim;
+        if (threadIdx.x < head_dim)
+            key[threadIdx.x] = k[kbase + threadIdx.x];
+        __syncthreads();
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (std::size_t g = 0; g < group; ++g) {
+                float score = 0.0f;
+                for (std::size_t d = 0; d < head_dim; ++d)
+                    score += queries[g * head_dim + d] * key[d];
+                scores[g * max_seq + w] = score * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (std::size_t g = 0; g < group; ++g) {
+            float* head_scores = scores + g * max_seq;
+            float maxv = -3.402823466e+38F;
+            for (std::size_t w = 0; w < window; ++w)
+                maxv = fmaxf(maxv, head_scores[w]);
+            float denom = 0.0f;
+            for (std::size_t w = 0; w < window; ++w) {
+                head_scores[w] = static_cast<float>(
+                    exp(static_cast<double>(head_scores[w] - maxv)));
+                denom += head_scores[w];
+            }
+            for (std::size_t w = 0; w < window; ++w)
+                head_scores[w] /= denom;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < head_dim) {
+        float value[group] = {};
+        for (std::size_t w = 0; w < window; ++w) {
+            const std::size_t key_row =
+                static_cast<std::size_t>(seg_offset[row]) + begin + w;
+            const std::size_t vbase =
+                (key_row * kv_heads + kh) * head_dim;
+            const float vv = v[vbase + threadIdx.x];
+#pragma unroll
+            for (std::size_t g = 0; g < group; ++g)
+                value[g] += scores[g * max_seq + w] * vv;
+        }
+#pragma unroll
+        for (std::size_t g = 0; g < group; ++g) {
+            const std::size_t qbase =
+                (row * q_heads + qh0 + g) * head_dim;
+            out[qbase + threadIdx.x] = value[g];
+        }
+    }
+}
+
 __global__ void k_gather_rows(
     const float* x, const std::uint32_t* rows, float* out,
     std::size_t count, std::size_t h) {
@@ -1118,13 +1212,24 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
                    std::size_t q_heads, std::size_t kv_heads,
                    std::size_t head_dim) {
     PackedMeta& meta = packed_meta(seq_lens);
-    const std::size_t shared =
-        (meta.max_seq + 2 * head_dim) * sizeof(float);
-    k_attention<<<meta.rows * q_heads, 128, shared>>>(
-        q.cuda_data(), k.cuda_data(), v.cuda_data(), out.cuda_data_write(),
-        meta.offset, meta.pos, meta.rows, q_heads, kv_heads, head_dim,
-        meta.max_seq);
-    check_cuda(cudaGetLastError(), "k_attention launch");
+    if (q_heads == 4 * kv_heads) {
+        const std::size_t shared =
+            (4 * meta.max_seq + 5 * head_dim) * sizeof(float);
+        k_attention_grouped_gqa4<<<meta.rows * kv_heads, 128, shared>>>(
+            q.cuda_data(), k.cuda_data(), v.cuda_data(), out.cuda_data_write(),
+            meta.offset, meta.pos, meta.rows, q_heads, kv_heads, head_dim,
+            meta.max_seq);
+        check_cuda(cudaGetLastError(),
+                   "k_attention_grouped_gqa4 launch");
+    } else {
+        const std::size_t shared =
+            (meta.max_seq + 2 * head_dim) * sizeof(float);
+        k_attention<<<meta.rows * q_heads, 128, shared>>>(
+            q.cuda_data(), k.cuda_data(), v.cuda_data(),
+            out.cuda_data_write(), meta.offset, meta.pos, meta.rows,
+            q_heads, kv_heads, head_dim, meta.max_seq);
+        check_cuda(cudaGetLastError(), "k_attention launch");
+    }
 }
 
 void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,

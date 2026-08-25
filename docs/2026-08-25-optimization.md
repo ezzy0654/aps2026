@@ -263,3 +263,37 @@ make -j4 USE_TC=1
 `K → row → col`, attention의 `key → dim`, MoE의 `expert → assigned token`
 순서는 각각 shared tile 재사용, 연속 reduction, expert GEMM batching에 맞는
 구조로 유지한다.
+
+## Grouped-GQA K/V memory reuse
+
+GQA에서 query head 4개가 하나의 KV head를 공유하지만 기존 attention kernel은
+`(token, query head)`마다 block을 만들어 동일한 K/V를 네 번 읽었다. 이를
+`(token, KV head)`마다 한 block으로 묶고 다음 순서로 변경했다.
+
+```text
+query 4개 shared staging
+for key:
+    K vector 1회 load
+    query 4개의 score를 원래 dimension 순서로 계산
+softmax는 head별 원래 key 순서 유지
+for key:
+    V vector 1회 load
+    query head 4개의 value accumulator 갱신
+```
+
+Block 수는 `tokens*16`에서 `tokens*4`로 줄고 K/V global load는 이론상 4분의
+1이 된다. 각 query head 내부의 QK dimension reduction과 value key reduction
+순서는 바꾸지 않아 검증 오차가 기존과 완전히 동일했다.
+
+| 구성 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| grouped GQA + split-BF16 1차 | 64 | 0.672233 | 95.205058 | PASSED |
+| grouped GQA + split-BF16 1차 | 1024 | 5.936697 | 172.486495 | PASSED |
+| 반복 1 | 1024 | 5.940850 | 172.365916 | PASSED |
+| 반복 2 | 1024 | 5.966226 | 171.632781 | PASSED |
+| grouped GQA + 기본 FP32 빌드 | 1024 | 6.031837 | 169.765858 | PASSED |
+
+split-BF16 빌드의 반복 중앙값은 5.940850초로 직전 공식 결과 6.029168초보다
+약 88ms, 1.46% 개선됐다. Nsight Systems에서 grouped attention 32회 합계는
+0.399138초였고, 기존 K-staging kernel의 약 0.484초보다 약 85ms 감소해 전체
+개선량과 일치했다. 사용자 요청에 따라 이 결과는 대회에 제출하지 않았다.
