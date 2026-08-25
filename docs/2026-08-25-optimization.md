@@ -225,3 +225,41 @@ make clean
 make -j4 USE_TC=1
 ./run.sh -n 1024 -v
 ```
+
+## 루프 순서 및 pre-pack 순서 ablation
+
+### WMMA weight traversal
+
+기존 WMMA 계산은 activation tile을 재사용하기 위해 `K tile → local N tile`
+순서로 돈다. 이에 맞춰 weight도 기존 `[N tile][K tile]`에서
+`[N block 64][K tile][local N tile 4]`로 바꿔 같은 K 단계의 warp들이
+연속 weight를 읽도록 실험했다.
+
+| 실행 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| K-major pre-pack 1차 | 64 | 0.663440 | 96.466926 | PASSED |
+| K-major pre-pack 1차 | 1024 | 6.005273 | 170.516806 | PASSED |
+| K-major pre-pack 반복 1 | 1024 | 6.036054 | 169.647256 | PASSED |
+| K-major pre-pack 반복 2 | 1024 | 6.036712 | 169.628757 | PASSED |
+
+첫 실행은 빨랐지만 반복 중앙값 6.036054초로 기존 공식 6.029168초보다
+개선되지 않아 원래 N-major pre-pack으로 복구했다. Weight tile 하나가 이미
+연속 512 bytes이고 L2가 간격 접근을 충분히 흡수해 배치 순서 효과가 작았다.
+
+### FP32 register GEMM inner loop
+
+기존 `K → thread-row → thread-col`에서 B shared 값 두 개를 먼저 레지스터에
+올리고 8개 row에 재사용하는 순서를 명시했다. 출력별 K 누적 순서는 유지되어
+검증 오차는 동일했다.
+
+| 실행 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| B register hoist 1차 | 1024 | 6.018018 | 170.155694 | PASSED |
+| B register hoist 반복 1 | 1024 | 6.055185 | 169.111263 | PASSED |
+| B register hoist 반복 2 | 1024 | 6.057044 | 169.059376 | PASSED |
+
+반복 중앙값이 6.055185초로 느려졌다. 명시적 배열이 register lifetime을 늘렸고
+컴파일러가 기존 루프에서 수행하던 hoist보다 불리해 원복했다. 현재 FP32 GEMM의
+`K → row → col`, attention의 `key → dim`, MoE의 `expert → assigned token`
+순서는 각각 shared tile 재사용, 연속 reduction, expert GEMM batching에 맞는
+구조로 유지한다.
