@@ -1413,6 +1413,12 @@ __global__ void k_rope(
     x[base + j + half] = x1 * c + x0 * s;
 }
 
+// One key slot per four threads. 16 keys x 4 heads keeps the staged tile
+// small enough that occupancy stays ahead of the barrier saving; 32 was
+// measured slower because the extra shared memory cost more residency than
+// the deeper tile bought.
+constexpr std::size_t ATTN_KEY_TILE = 16;
+
 __global__ void k_attention(
     const float* q, const float* k, const float* v, float* out,
     const std::uint32_t* seg_offset, const std::uint32_t* seg_pos,
@@ -1508,15 +1514,16 @@ __global__ void k_attention_grouped_gqa4(
     const std::size_t window = pos - begin + 1;
     extern __shared__ float shared[];
     // scores[w * group + g] and queries[d * group + g] keep the group index
-    // fastest so the four score threads never share a shared-memory bank.
+    // fastest so the score threads never share a shared-memory bank. keys is
+    // a tile of ATTN_KEY_TILE staged key vectors, row-padded by one float so
+    // the tile's rows land in different banks.
+    const std::size_t key_stride = head_dim + 1;
     float* scores = shared;
     float* queries = scores + group * max_seq;
-    float* key = queries + group * head_dim;
+    float* keys = queries + group * head_dim;
     const std::size_t qh0 = kh * group;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    // Read q coalesced (consecutive threads take consecutive d) but store
-    // transposed so the score pass reads one bank per head.
     for (std::size_t i = threadIdx.x; i < group * head_dim;
          i += blockDim.x) {
         const std::size_t g = i / head_dim;
@@ -1526,37 +1533,51 @@ __global__ void k_attention_grouped_gqa4(
     }
     __syncthreads();
 
-    const std::size_t g = threadIdx.x;
+    // Scores for different keys are independent until the softmax, so run a
+    // whole tile of them at once: thread t owns head t % group of key slot
+    // t / group. Each score is still accumulated by a single thread over
+    // d = 0..head_dim-1 in order, so the values are unchanged; what drops is
+    // the barrier count, from two per key to two per tile.
+    const std::size_t g = threadIdx.x % group;
+    const std::size_t slot = threadIdx.x / group;
     const float* my_query = queries + g;
-    for (std::size_t w = 0; w < window; ++w) {
-        const std::size_t key_row =
-            static_cast<std::size_t>(seg_offset[row]) + begin + w;
-        const std::size_t kbase = (key_row * kv_heads + kh) * head_dim;
-        if (threadIdx.x < head_dim)
-            key[threadIdx.x] = k[kbase + threadIdx.x];
+    for (std::size_t base = 0; base < window; base += ATTN_KEY_TILE) {
+        const std::size_t count = window - base < ATTN_KEY_TILE
+            ? window - base : ATTN_KEY_TILE;
+        for (std::size_t i = threadIdx.x; i < count * head_dim;
+             i += blockDim.x) {
+            const std::size_t ks = i / head_dim;
+            const std::size_t d = i % head_dim;
+            const std::size_t key_row =
+                static_cast<std::size_t>(seg_offset[row]) + begin + base + ks;
+            const std::size_t kbase = (key_row * kv_heads + kh) * head_dim;
+            keys[ks * key_stride + d] = k[kbase + d];
+        }
         __syncthreads();
-        if (g < group) {
+        if (slot < count) {
+            const float* my_key = keys + slot * key_stride;
             float score = 0.0f;
             for (std::size_t d = 0; d < head_dim; ++d)
-                score += my_query[d * group] * key[d];
-            scores[w * group + g] = score * scale;
+                score += my_query[d * group] * my_key[d];
+            scores[(base + slot) * group + g] = score * scale;
         }
         __syncthreads();
     }
 
-    if (g < group) {
+    if (threadIdx.x < group) {
+        const std::size_t gi = threadIdx.x;
         float maxv = -3.402823466e+38F;
         for (std::size_t w = 0; w < window; ++w)
-            maxv = fmaxf(maxv, scores[w * group + g]);
+            maxv = fmaxf(maxv, scores[w * group + gi]);
         float denom = 0.0f;
         for (std::size_t w = 0; w < window; ++w) {
             const float e = static_cast<float>(
-                exp(static_cast<double>(scores[w * group + g] - maxv)));
-            scores[w * group + g] = e;
+                exp(static_cast<double>(scores[w * group + gi] - maxv)));
+            scores[w * group + gi] = e;
             denom += e;
         }
         for (std::size_t w = 0; w < window; ++w)
-            scores[w * group + g] /= denom;
+            scores[w * group + gi] /= denom;
     }
     __syncthreads();
 
@@ -2011,7 +2032,8 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
     PackedMeta& meta = packed_meta(seq_lens);
     if (q_heads == 4 * kv_heads) {
         const std::size_t shared =
-            (4 * meta.max_seq + 5 * head_dim) * sizeof(float);
+            (4 * meta.max_seq + 4 * head_dim +
+             ATTN_KEY_TILE * (head_dim + 1)) * sizeof(float);
         k_attention_grouped_gqa4<<<meta.rows * kv_heads, 128, shared>>>(
             q.cuda_data(), k.cuda_data(), v.cuda_data(), out.cuda_data_write(),
             meta.offset, meta.pos, meta.rows, q_heads, kv_heads, head_dim,

@@ -766,3 +766,61 @@ IDENTICAL이다.
   사라지고 global store도 연속이 된다. 미착수.
 - attention은 occupancy가 아니라 issue rate 24.5%가 문제다. limiter가 이미
   warps(12)라 occupancy로는 더 얻을 게 없다.
+
+## Attention key tiling
+
+`k_attention_grouped_gqa4`의 score 구간은 key를 하나씩 처리하면서 key마다
+`__syncthreads()`를 2회 걸었고, 그 사이에 128 threads 중 4개만 계산했다. ncu
+기준 warp이 활성 시간의 63.2%를 barrier에서 대기했다.
+
+서로 다른 key의 score는 softmax 전까지 독립이므로 key를 tile 단위로 묶어
+한꺼번에 계산하도록 바꿨다. thread `t`가 key slot `t / 4`의 head `t % 4`를
+맡는다.
+
+- 각 score는 여전히 단일 thread가 `d = 0..127` 순차 FP32 FMA로 누적한다
+- barrier가 key당 2회에서 tile당 2회로 줄어든다
+- 이 데이터는 시퀀스가 평균 약 19 토큰이라 대부분의 row가 tile 하나로 끝난다
+- key tile은 행마다 float 하나를 덧대 bank가 갈리게 했다
+
+### tile 크기 선택
+
+tile을 키우면 barrier는 줄지만 shared 사용량이 늘어 occupancy가 떨어진다.
+
+| tile | n=1024 시간(초) | 판정 |
+|---|---:|---|
+| 없음 (baseline) | 3.715407 | |
+| 32 | 3.707923 | shared 16.5KB, occupancy 90% → 40% |
+| **16** | **3.690873** | 채택 |
+| 8 | 3.691629 | 16과 동등 |
+
+tile 32는 n=64 기준 attention kernel을 332.8us에서 266.5us로 20% 줄였고 barrier
+stall도 63.2%에서 39.8%로 내렸지만, 달성 occupancy가 90.4%에서 39.9%로
+떨어져 전체 이득이 깎였다. 16이 두 효과의 균형점이다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| baseline | 3.761359 | 272.242060 |
+| key tile 16 | 3.726404 | 274.795783 |
+| baseline | 3.764890 | 271.986682 |
+| key tile 16 | 3.723553 | 275.006185 |
+
+중앙값 3.761488초 → 3.726404초로 약 35ms, 0.9% 개선됐다. 출력 binary는
+IDENTICAL이다.
+
+## 폐기: padded GEMM kernel의 bank conflict 제거
+
+`Bs[tx * BIG_TN + cc][p]`는 stride `BIG_BK + 1`에서 `bank = (2·tx + cc + p) mod 32`가
+되어 짝수 뱅크 16개만 쓴다. 열 매핑을 `cc * BIG_BX + tx`로 바꾸면 `bank =
+(tx + p) mod 32`가 되어 conflict가 사라지고 epilogue store도 연속이 된다.
+
+실제로 ncu 기준 shared load conflict가 `k_moe_pair_silu_grouped` 458,752 → 0,
+`k_matmul_pair_bias_register_blocked` 98,304 → 0이 됐다. 그런데 느려졌다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| baseline | 3.739176 | 273.857096 |
+| conflict 0 | 3.775107 | 271.250554 |
+
+출력은 IDENTICAL이었으나 약 36ms 회귀라 폐기했다. stall 분해를 보면
+`k_moe_pair_silu_grouped`의 shared stall은 1.6%에 불과했고 실제 병목은 global
+15.8%였다. counter 절대값이 크다고 critical path인 것이 아니다.
