@@ -1401,6 +1401,13 @@ __global__ void k_attention(
 // block so each key vector and value vector is fetched once instead of four
 // times. The reduction order within every individual head remains d=0..127
 // for QK and key=0..window-1 for the weighted value sum.
+//
+// The four heads of a group are independent until the value combine, so one
+// thread per head runs the score and softmax passes instead of thread 0
+// running all four back to back. Each head keeps its own sequential FP32
+// accumulation order, so the results stay bit-identical. Queries and scores
+// are stored head-minor so the four active threads land in four different
+// shared-memory banks.
 __global__ void k_attention_grouped_gqa4(
     const float* q, const float* k, const float* v, float* out,
     const std::uint32_t* seg_offset, const std::uint32_t* seg_pos,
@@ -1417,21 +1424,27 @@ __global__ void k_attention_grouped_gqa4(
             ? pos + 1 - apss26::SLIDING_WINDOW : 0;
     const std::size_t window = pos - begin + 1;
     extern __shared__ float shared[];
+    // scores[w * group + g] and queries[d * group + g] keep the group index
+    // fastest so the four score threads never share a shared-memory bank.
     float* scores = shared;
     float* queries = scores + group * max_seq;
     float* key = queries + group * head_dim;
     const std::size_t qh0 = kh * group;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
+    // Read q coalesced (consecutive threads take consecutive d) but store
+    // transposed so the score pass reads one bank per head.
     for (std::size_t i = threadIdx.x; i < group * head_dim;
          i += blockDim.x) {
         const std::size_t g = i / head_dim;
         const std::size_t d = i % head_dim;
         const std::size_t qbase = (row * q_heads + qh0 + g) * head_dim;
-        queries[i] = q[qbase + d];
+        queries[d * group + g] = q[qbase + d];
     }
     __syncthreads();
 
+    const std::size_t g = threadIdx.x;
+    const float* my_query = queries + g;
     for (std::size_t w = 0; w < window; ++w) {
         const std::size_t key_row =
             static_cast<std::size_t>(seg_offset[row]) + begin + w;
@@ -1439,34 +1452,28 @@ __global__ void k_attention_grouped_gqa4(
         if (threadIdx.x < head_dim)
             key[threadIdx.x] = k[kbase + threadIdx.x];
         __syncthreads();
-        if (threadIdx.x == 0) {
-#pragma unroll
-            for (std::size_t g = 0; g < group; ++g) {
-                float score = 0.0f;
-                for (std::size_t d = 0; d < head_dim; ++d)
-                    score += queries[g * head_dim + d] * key[d];
-                scores[g * max_seq + w] = score * scale;
-            }
+        if (g < group) {
+            float score = 0.0f;
+            for (std::size_t d = 0; d < head_dim; ++d)
+                score += my_query[d * group] * key[d];
+            scores[w * group + g] = score * scale;
         }
         __syncthreads();
     }
 
-    if (threadIdx.x == 0) {
-#pragma unroll
-        for (std::size_t g = 0; g < group; ++g) {
-            float* head_scores = scores + g * max_seq;
-            float maxv = -3.402823466e+38F;
-            for (std::size_t w = 0; w < window; ++w)
-                maxv = fmaxf(maxv, head_scores[w]);
-            float denom = 0.0f;
-            for (std::size_t w = 0; w < window; ++w) {
-                head_scores[w] = static_cast<float>(
-                    exp(static_cast<double>(head_scores[w] - maxv)));
-                denom += head_scores[w];
-            }
-            for (std::size_t w = 0; w < window; ++w)
-                head_scores[w] /= denom;
+    if (g < group) {
+        float maxv = -3.402823466e+38F;
+        for (std::size_t w = 0; w < window; ++w)
+            maxv = fmaxf(maxv, scores[w * group + g]);
+        float denom = 0.0f;
+        for (std::size_t w = 0; w < window; ++w) {
+            const float e = static_cast<float>(
+                exp(static_cast<double>(scores[w * group + g] - maxv)));
+            scores[w * group + g] = e;
+            denom += e;
         }
+        for (std::size_t w = 0; w < window; ++w)
+            scores[w * group + g] /= denom;
     }
     __syncthreads();
 
@@ -1478,15 +1485,16 @@ __global__ void k_attention_grouped_gqa4(
             const std::size_t vbase =
                 (key_row * kv_heads + kh) * head_dim;
             const float vv = v[vbase + threadIdx.x];
+            const float* ws = scores + w * group;
 #pragma unroll
-            for (std::size_t g = 0; g < group; ++g)
-                value[g] += scores[g * max_seq + w] * vv;
+            for (std::size_t gi = 0; gi < group; ++gi)
+                value[gi] += ws[gi] * vv;
         }
 #pragma unroll
-        for (std::size_t g = 0; g < group; ++g) {
+        for (std::size_t gi = 0; gi < group; ++gi) {
             const std::size_t qbase =
-                (row * q_heads + qh0 + g) * head_dim;
-            out[qbase + threadIdx.x] = value[g];
+                (row * q_heads + qh0 + gi) * head_dim;
+            out[qbase + threadIdx.x] = value[gi];
         }
     }
 }

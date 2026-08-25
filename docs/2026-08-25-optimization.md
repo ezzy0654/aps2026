@@ -428,3 +428,73 @@ pre-pack해 attention projection 124개를 Tensor Core로 실행했다. 기존 �
 주된 원인은 Tensor Core FP32 accumulator의 연산 순서 차이가 여러 layer를 거쳐
 MoE top-2 routing을 바꾸는 것이다. 이 실험은 n=1024 성능 측정과 제출을 하지
 않고 폐기했으며, 기존의 LM head + layer 31 attention 제한 경로를 유지한다.
+
+## Grouped attention Q-head 4-way 병렬화
+
+### 측정 방법 정정: 노드 간 편차
+
+이 실험 도중 `aps` partition의 노드마다 같은 binary의 실행 시간이 크게 다르다는
+사실을 확인했다. 같은 baseline binary가 n=64에서 0.381초(빠른 노드)와
+0.590초(느린 노드)로 측정됐다. 따라서 이번 실험부터 baseline과 변경본을
+**하나의 `srun` 할당 안에서 번갈아 실행**해 비교했다.
+
+같은 이유로 validation 최대 절대 오차도 노드에 따라 달라진다. 동일 binary가
+n=64에서 노드에 따라 0.00174713과 0.000102997을 보고했다. 오차 값 변화만으로
+연산 순서 변경을 판단하면 안 되며, 실제 판정은 출력 binary 비교로 해야 한다.
+
+### 채택: head별 score/softmax thread 배정
+
+`k_attention_grouped_gqa4`는 K/V를 4개 query head가 공유하지만, score와 softmax는
+thread 0이 head 4개를 연달아 계산했다. GQA group의 4개 head는 value combine
+전까지 서로 독립이므로 thread 0–3에 head를 하나씩 배정했다.
+
+- 각 head의 QK 누적은 여전히 `d=0..127` 단일 thread 순차 FP32 FMA다.
+- softmax의 max, exp, denom, 정규화도 head별 단일 thread 순차 계산이다.
+- `queries`와 `scores`를 head-minor(`[d][g]`, `[w][g]`)로 저장해 4개 thread가
+  서로 다른 shared memory bank에 접근하게 했다.
+- `q` 적재는 coalesced 순서를 유지하고 shared 저장만 transpose한다.
+- shared memory 사용량은 `4*max_seq + 5*head_dim` floats로 동일하다.
+
+### 비트 동일성 검증
+
+출력 binary를 baseline과 직접 비교했다.
+
+| 비교 | 결과 |
+|---|---|
+| n=8 출력 binary | IDENTICAL |
+| n=64 출력 binary | IDENTICAL |
+| n=1024 출력 binary | IDENTICAL |
+
+연산 순서를 바꾸지 않았으므로 MoE routing에도 영향이 없다.
+
+### 성능
+
+같은 노드(b5) 안에서 번갈아 3회씩 실행했다.
+
+| 구성 | n | 시간(초) | 처리량(seq/s) | 최대 절대 오차 | 검증 |
+|---|---:|---:|---:|---:|---|
+| baseline | 1024 | 5.593363 | 183.074110 | 0.0045929 | PASSED |
+| head 4-way | 1024 | 5.336384 | 191.890234 | 0.0045929 | PASSED |
+| baseline | 1024 | 5.592794 | 183.092742 | 0.0045929 | PASSED |
+| head 4-way | 1024 | 5.355142 | 191.218098 | 0.0045929 | PASSED |
+| baseline | 1024 | 5.603171 | 182.753652 | 0.0045929 | PASSED |
+| head 4-way | 1024 | 5.350063 | 191.399628 | 0.0045929 | PASSED |
+
+중앙값 기준 5.592794초에서 5.350063초로 약 243ms, 4.3% 개선됐다.
+
+Nsight 기준 n=1024 kernel 합계(노드 b6):
+
+| kernel | baseline | head 4-way |
+|---|---:|---:|
+| `k_matmul_transposed_register_blocked_async` | 1574.1 ms | 1590.5 ms |
+| `k_moe_pair_silu_grouped` | 790.2 ms | 798.1 ms |
+| `k_matmul_pair_bias_register_blocked` | 441.7 ms | 442.2 ms |
+| `k_moe_matmul_grouped` | 385.8 ms | 386.6 ms |
+| `k_attention_grouped_gqa4` | 390.6 ms | 112.0 ms |
+| 전체 kernel 합계 | 4070.1 ms | 3821.4 ms |
+
+attention kernel은 390.6ms에서 112.0ms로 3.49배 빨라졌고 278.6ms를 줄였다.
+전체 GPU kernel 시간에서 attention 비중은 9.6%에서 2.9%로 내려가, 다음 병목은
+GEMM(전체의 약 84%)과 kernel 사이 공백 시간이다.
+
+사용자 요청에 따라 이 버전은 대회에 제출하지 않았다.
