@@ -919,3 +919,90 @@ TF32는 이 카드에서 FP32와 동일하고, 보정하면 MMA를 3회 해야 �
 600 seq/s(1.707초)는 GEMM에 0.783초만 허용하므로 50.8 TFLOPS가 필요하다.
 검증을 유지하는 어떤 경로도 이 값에 도달하지 못한다. 현실적인 상한은
 330~350 seq/s다.
+
+## 200 ms H2D gap 재확인과 embedding gather의 GPU 이전
+
+### 문서에 적힌 200 ms gap은 이미 사라졌다
+
+앞의 "CUDA Graph 검토" 절은 첫 GEMM 앞에 layer 0 attention weight H2D로 인한
+200.2 ms 단일 gap이 있다고 기록했다. 현재 코드(prefix-dedup, dc338bf)에서
+`Tensor::prepare_cuda()`에 계측을 넣어 다시 확인했다.
+
+- 프로그램 전체 `prepare_cuda()` 호출 4,720회.
+- 그중 timed region 안에서 실제 H2D 복사가 일어나는 것은 **단 1건**,
+  `hidden` embedding 결과 255.3 MB(alloc 0.70 ms + copy 26.05 ms)뿐이다.
+- attention weight와 lm_head를 포함한 모든 weight는 `ModelLoader::load()`가
+  마지막 줄에서 `out.prepare_cuda()`를 호출하므로 model load 단계에서 이미
+  올라가 있다. timed region에는 weight H2D가 남아 있지 않다.
+
+즉 200 ms gap의 원인으로 지목됐던 weight H2D는 이후 커밋에서 제거됐고, 그
+기록은 현재 코드에 해당하지 않는다.
+
+### 실제로 남아 있던 것은 host embedding gather였다
+
+`generate()`에 host 타임스탬프를 넣어 측정한 결과(n=1024)다.
+
+| 구간 | host 시간 |
+|---|---:|
+| generate 진입 → trie 완성 | 1.9 ms |
+| trie 완성 → embedding gather 완료 | 165.8 ms |
+| gather 완료 → layer 루프 시작 | 0.2 ms |
+| layer 루프 32개 enqueue 전체 | 86.6 ms |
+| layer 루프 종료 → generate 반환(GPU 대기) | 2,418 ms |
+
+host는 32개 layer를 86.6 ms 만에 전부 enqueue하고 나머지는 GPU를 기다린다.
+따라서 layer 루프 앞의 167.7 ms는 GPU가 완전히 idle인 순수 host 구간이다.
+`hidden`은 모든 layer의 첫 입력이므로 이 시간은 어떤 GPU 작업과도 겹칠 수
+없다.
+
+165.8 ms의 내역은 255.3 MB짜리 host 버퍼의 최초 할당·zero-fill(`data_.assign`)
+과 15,583행 × 16 KB의 gather memcpy다. 그 뒤에 layer 0이 같은 255.3 MB를
+다시 H2D로 올린다.
+
+### 채택: embedding gather를 GPU에서 수행
+
+embedding table(525 MB)은 이미 device에 상주해 있다. gather를 GPU로 옮기면
+host 255 MB 할당·zero-fill, host gather memcpy, 255 MB H2D 업로드 세 패스가
+모두 사라지고 62 KB index 업로드와 kernel 하나만 남는다.
+
+```
+Tensor hidden({nodes, apss26::HIDDEN_SIZE});
+tensor_ops::gather_rows_gpu(embeddings_, node_token, hidden);
+```
+
+`gather_rows_gpu`는 prefix expansion이 이미 쓰던 경로다. 같은 행을 같은 순서로
+복사하는 순수 copy라 결과는 bit-identical이며, 작업은 여전히 timed region 안에
+있다. timed region 밖으로 옮기거나 결과를 미리 캐시하지 않는다.
+
+### 측정
+
+노드 b6, `make clean && make USE_TC=1`, n=1024. 두 바이너리를 번갈아 실행했다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) | 최대 절대 오차 | 평균 절대 오차 |
+|---|---:|---:|---:|---:|
+| baseline | 2.743767 | 373.209577 | 0.00369644 | 0.000505105 |
+| baseline | 2.762259 | 370.711120 | 0.00369644 | 0.000505105 |
+| baseline | 3.301946 | — | 0.00369644 | 0.000505105 |
+| baseline | 3.303727 | — | 0.00369644 | 0.000505105 |
+| baseline | 2.748124 | — | 0.00369644 | 0.000505105 |
+| baseline | 2.741028 | — | 0.00369644 | 0.000505105 |
+| baseline | 2.744017 | — | 0.00369644 | 0.000505105 |
+| baseline | 2.759655 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 2.565368 | 399.162967 | 0.00369644 | 0.000505105 |
+| GPU gather | 3.139407 | 326.176230 | 0.00369644 | 0.000505105 |
+| GPU gather | 2.568856 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 2.562972 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 2.569810 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 2.564727 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 2.568114 | — | 0.00369644 | 0.000505105 |
+| GPU gather | 3.139274 | — | 0.00369644 | 0.000505105 |
+
+이 노드는 두 개의 mode를 보인다. 빠른 mode는 baseline 2.74~2.76초 / GPU gather
+2.563~2.570초, 느린 mode는 baseline 3.30초 / GPU gather 3.14초다. 두 mode
+모두에서 이득이 나타난다.
+
+중앙값은 2.753초 → 2.569초로 약 184 ms, 6.7% 단축이다. 처리량은 372 seq/s에서
+399 seq/s가 된다.
+
+출력 binary는 baseline과 byte 단위로 IDENTICAL이며(`cmp` 확인), 검증값은
+0.00369644 / 0.000505105로 변하지 않았다.

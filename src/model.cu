@@ -61,11 +61,6 @@ void PhiTinyMoEModel::generate(
         total += len;
     }
 
-    // Embedding gather is a pure row copy. Going through Tensor::at() runs
-    // ensure_host() plus a bounds-checked offset() for every one of the
-    // total_tokens * HIDDEN_SIZE elements, which dominated the host side of
-    // the timed region. Resolve the two base pointers once and copy whole
-    // rows instead; the bytes written are identical.
     // Prefix deduplication. Attention is causal and the sequences are
     // independent, so a token's hidden state is a pure function of the prefix
     // ending at it: two sequences sharing a prefix produce bit-identical rows
@@ -122,15 +117,15 @@ void PhiTinyMoEModel::generate(
     }
     const std::size_t nodes = node_token.size();
 
+    // Embedding gather runs on the GPU. The embedding table is already
+    // device-resident, so gathering there replaces three host-side passes over
+    // 255 MB -- allocating and zero-filling the host buffer, the row memcpy,
+    // and the H2D upload of the result -- with a 62 KB index upload and one
+    // kernel. Those passes were pure host time with the GPU idle, since the
+    // hidden states are the first thing every layer needs. The bytes written
+    // are the same rows in the same order, so the result is bit-identical.
     Tensor hidden({nodes, apss26::HIDDEN_SIZE});
-    float* hidden_rows = hidden.data();
-    const float* embedding_rows = embeddings_.data();
-#pragma omp parallel for schedule(static)
-    for (std::size_t row = 0; row < nodes; ++row) {
-        std::memcpy(hidden_rows + row * apss26::HIDDEN_SIZE,
-                    embedding_rows + node_token[row] * apss26::HIDDEN_SIZE,
-                    apss26::HIDDEN_SIZE * sizeof(float));
-    }
+    tensor_ops::gather_rows_gpu(embeddings_, node_token, hidden);
 
     const tensor_ops::RowIndexBuffer node_pos_rows(node_depth);
     const tensor_ops::RowIndexBuffer node_anc_rows(node_anc);
