@@ -689,3 +689,80 @@ occupancy가 내려가는데도 barrier 절감이 더 컸다.
 | dual B tile | 3.912432 | 261.729773 |
 
 세션 시작 대비 1.38배다. 사용자 요청에 따라 제출하지 않았다.
+
+## Thread block 스케줄링 분석과 occupancy 개선
+
+### ncu 실측
+
+| kernel | regs/thread | occupancy limiter (block/SM) | 달성 occupancy | SM tput | issue | shared load conflict |
+|---|---:|---|---:|---:|---:|---:|
+| Q/O async | 130 | shared 1 · regs 1 · warps 6 | 16.66% | 33.9% | 55.3% | 0 |
+| MoE W2 async | 148 | shared 1 · regs 1 · warps 6 | 16.65% | 55.1% | 55.4% | 0 |
+| MoE W1/W3 | 110 | shared 2 · regs 2 · warps 6 | 22.89% | 41.8% | 56.4% | 458,752 |
+| K/V pair | 96 | shared 2 · regs 2 · warps 6 | 16.66% | 14.1% | 48.4% | 98,304 |
+| attention | 40 | shared 16 · regs 12 · warps 12 | 39.93% | 38.8% | 24.5% | 0 |
+
+### grid와 wave 구조는 문제가 없다
+
+n=1024, SM 82개 기준이다.
+
+| kernel | grid | wave 수 |
+|---|---:|---:|
+| Q proj | 9,920 | 121.0 |
+| O proj | 19,840 | 242.0 |
+| K/V pair | 2,480 | 15.1 |
+| MoE W1/W3 | 4,445 | 27.1 |
+| MoE W2 | 40,640 | 495.6 |
+| attention | 79,212 | 80.5 |
+
+모든 kernel이 wave를 충분히 많이 돌아 tail effect와 wave quantization은 무시할
+수준이다. MoE work queue에서 `work_expert[wi] >= NUM_EXPERTS`로 즉시 return하는
+빈 block은 635개 중 최대 16개(2.5%)다. 병목은 grid 배분이 아니라 SM당 block
+점유율이었다.
+
+### 채택: __launch_bounds__ + shared carveout
+
+Q/O와 MoE W2가 SM당 block 1개로 돌고 있었다. 제약이 두 개 동시에 걸려 있었다.
+
+- 레지스터: 130 regs × 256 threads = 33,280 regs. SM 정원 65,536 → 1 block
+- shared: static 32,768 B. SM에 100 KB를 쓸 수 있는데도 driver가 작은 carveout을
+  골라 1 block
+
+둘 중 하나만 풀면 효과가 없다. 실제로 첫 시도에서 `__launch_bounds__(256, 2)`만
+적용했더니 register limiter는 1 → 2가 됐지만 shared limiter가 1에 머물러 달성
+occupancy가 16.66%로 그대로였고, n=1024도 4.709946초 → 4.705134초로 변화가
+없었다.
+
+`cudaFuncAttributePreferredSharedMemoryCarveout`에 50(%)을 요청한 것도 조용히
+무시됐다. `cudaSharedmemCarveoutMaxShared`로 바꾸자 비로소 적용됐다.
+
+| 지표 | 이전 | 이후 |
+|---|---:|---:|
+| register limiter | 1 | 2 |
+| shared limiter | 1 | 3 |
+| 실질 block/SM | 1 | 2 |
+| 달성 occupancy (W2) | 16.65% | 32.38% |
+
+`cuobjdump -res-usage` 기준 두 kernel 모두 `REG:128 STACK:0 LOCAL:0`으로 spill이
+없다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| baseline | 3.847106 | 266.174115 |
+| launch_bounds + carveout | 3.695074 | 277.125700 |
+| baseline | 3.845897 | 266.257769 |
+| launch_bounds + carveout | 3.704769 | 276.400466 |
+| baseline | 3.856764 | 265.507534 |
+| launch_bounds + carveout | 3.698225 | 276.889572 |
+
+중앙값 3.847106초 → 3.698225초로 약 149ms, 3.9% 개선됐다. 출력 binary는
+IDENTICAL이다.
+
+### 남은 항목
+
+- padded kernel 두 개의 2-way shared load bank conflict. `Bs[tx * BIG_TN + cc][p]`는
+  stride 33에서 `bank = (2·tx + cc + p) mod 32`가 되어 짝수 뱅크 16개만 쓴다.
+  padding 값으로는 못 고치고, 열 매핑을 `cc * BIG_BX + tx`로 바꾸면 conflict가
+  사라지고 global store도 연속이 된다. 미착수.
+- attention은 occupancy가 아니라 issue rate 24.5%가 문제다. limiter가 이미
+  warps(12)라 occupancy로는 더 얻을 게 없다.

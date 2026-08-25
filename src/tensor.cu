@@ -467,6 +467,21 @@ constexpr int BIG_BY = 8;
 constexpr int BIG_TM = BIG_BM / BIG_BY;
 constexpr int BIG_TN = BIG_BN / BIG_BX;
 
+// sm_86 splits a 128 KB unified L1/shared block per SM in fixed carveout
+// steps. A kernel holding 32 KB of static shared gets a 32 KB carveout by
+// default, which caps residency at one block per SM no matter how small the
+// register footprint is. Ask for half the block (64 KB) so two of them fit;
+// the register budget set by __launch_bounds__ is what holds it at two.
+void prefer_shared_carveout(const void* kernel) {
+    // cudaSharedmemCarveoutMaxShared asks for the whole 100 KB shared
+    // partition. A 50% request was silently kept at the default carveout,
+    // so the shared limiter stayed at one block per SM.
+    if (cudaFuncSetAttribute(
+            kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared) != cudaSuccess)
+        cudaGetLastError();
+}
+
 __device__ __forceinline__ void cp_async_16(
     void* dst, const void* src, int valid_bytes) {
 #if __CUDA_ARCH__ >= 800
@@ -569,7 +584,8 @@ __global__ void k_matmul_transposed_bf16_wmma(
 }
 #endif
 
-__global__ void k_matmul_transposed_register_blocked_async(
+__global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
+k_matmul_transposed_register_blocked_async(
     const float* __restrict__ a, const float* __restrict__ b,
     float* __restrict__ c,
     std::size_t m, std::size_t k, std::size_t n) {
@@ -1191,7 +1207,8 @@ __global__ void k_moe_matmul_grouped(
 // full and every 16-byte copy stays aligned. The K accumulation order is
 // unchanged -- p0 ascending, then p = 0..BIG_BK-1 -- so results are identical
 // to k_moe_matmul_grouped.
-__global__ void k_moe_matmul_grouped_async(
+__global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
+k_moe_matmul_grouped_async(
     const float* a, const float* const* weights, float* out,
     const std::uint32_t* offsets, const std::uint32_t* work_expert,
     const std::uint32_t* work_start, std::size_t max_work,
@@ -1773,6 +1790,12 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
         static_cast<unsigned>((h + BIG_BN - 1) / BIG_BN),
         static_cast<unsigned>(max_work));
     if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0) {
+        static const bool carveout_set = [] {
+            prefer_shared_carveout(reinterpret_cast<const void*>(
+                k_moe_matmul_grouped_async));
+            return true;
+        }();
+        (void)carveout_set;
         k_moe_matmul_grouped_async<<<out_grid, block>>>(
             activated.cuda_data(), weights.w2,
             expert_output.cuda_data_write(),
@@ -1823,6 +1846,12 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
             static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
             static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
         if (k % BIG_BK == 0) {
+            static const bool carveout_set = [] {
+                prefer_shared_carveout(reinterpret_cast<const void*>(
+                    k_matmul_transposed_register_blocked_async));
+                return true;
+            }();
+            (void)carveout_set;
             k_matmul_transposed_register_blocked_async<<<grid, block>>>(
                 da, db, dc, m, k, n);
             check_cuda(cudaGetLastError(),
