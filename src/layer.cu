@@ -149,8 +149,19 @@ void PhiAttention::forward(const Tensor& x, Tensor& y, const std::vector<std::si
     const std::size_t s = x.size(0);
     Tensor q, k, v;
     q_proj_.forward(x, q, use_gpu);
-    k_proj_.forward(x, k, use_gpu);
-    v_proj_.forward(x, v, use_gpu);
+    const bool fuse_kv = use_gpu &&
+        !k_proj_.weight().has_cuda_bf16_weight() &&
+        !v_proj_.weight().has_cuda_bf16_weight();
+    if (fuse_kv) {
+        k = Tensor({s, k_proj_.weight().size(0)});
+        v = Tensor({s, v_proj_.weight().size(0)});
+        tensor_ops::matmul_pair_bias_gpu(
+            x, k_proj_.weight(), k_proj_.bias(), k,
+            v_proj_.weight(), v_proj_.bias(), v);
+    } else {
+        k_proj_.forward(x, k, use_gpu);
+        v_proj_.forward(x, v, use_gpu);
+    }
     Tensor out({s, apss26::NUM_ATTENTION_HEADS * apss26::HEAD_DIM});
     if (use_gpu) {
         tensor_ops::apply_rope_gpu(

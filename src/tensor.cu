@@ -467,6 +467,35 @@ constexpr int BIG_BY = 8;
 constexpr int BIG_TM = BIG_BM / BIG_BY;
 constexpr int BIG_TN = BIG_BN / BIG_BX;
 
+__device__ __forceinline__ void cp_async_16(
+    void* dst, const void* src, int valid_bytes) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned smem = static_cast<unsigned>(
+        __cvta_generic_to_shared(dst));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::
+        "r"(smem), "l"(src), "r"(valid_bytes));
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_one() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
 #ifdef USE_TC
 __global__ void k_matmul_transposed_bf16_wmma(
     const float* __restrict__ a,
@@ -536,6 +565,84 @@ __global__ void k_matmul_transposed_bf16_wmma(
     }
 }
 #endif
+
+__global__ void k_matmul_transposed_register_blocked_async(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ c,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ __align__(16) float As[2][BIG_BM][BIG_BK];
+    __shared__ __align__(16) float Bs[2][BIG_BN][BIG_BK];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t block_row =
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN;
+    const std::size_t row0 = block_row + ty * BIG_TM;
+    const std::size_t col0 = block_col + tx * BIG_TN;
+    float acc[BIG_TM][BIG_TN] = {};
+    const std::size_t tiles = k / BIG_BK;
+
+    auto issue = [&](int stage, std::size_t p0) {
+        constexpr int vectors_per_tile = BIG_BM * BIG_BK / 4;
+        for (int vec = tid; vec < vectors_per_tile;
+             vec += BIG_BX * BIG_BY) {
+            const int lr = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const std::size_t row = block_row + lr;
+            const float* src = row < m
+                ? a + row * k + p0 + chunk * 4 : a;
+            cp_async_16(&As[stage][lr][chunk * 4], src,
+                        row < m ? 16 : 0);
+        }
+        for (int vec = tid; vec < vectors_per_tile;
+             vec += BIG_BX * BIG_BY) {
+            const int lc = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const int swizzled = chunk ^ ((lc >> 1) & 7);
+            const std::size_t col = block_col + lc;
+            const float* src = col < n
+                ? b + col * k + p0 + chunk * 4 : b;
+            cp_async_16(&Bs[stage][lc][swizzled * 4], src,
+                        col < n ? 16 : 0);
+        }
+        cp_async_commit();
+    };
+
+    issue(0, 0);
+    for (std::size_t tile = 0; tile < tiles; ++tile) {
+        const int stage = tile & 1;
+        if (tile + 1 < tiles) {
+            issue(stage ^ 1, (tile + 1) * BIG_BK);
+            cp_async_wait_one();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p) {
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[stage][ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc) {
+                    const int lc = tx * BIG_TN + cc;
+                    const int physical_p =
+                        ((p / 4) ^ ((lc >> 1) & 7)) * 4 + (p & 3);
+                    acc[r][cc] += av * Bs[stage][lc][physical_p];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < BIG_TN; ++cc) {
+            const std::size_t row = row0 + r, col = col0 + cc;
+            if (row < m && col < n) c[row * n + col] = acc[r][cc];
+        }
+}
 
 __global__ void k_matmul_transposed_register_blocked(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -680,6 +787,97 @@ __global__ void k_matmul_pair_silu_register_blocked(
                     (1.0f + static_cast<float>(
                         exp(static_cast<double>(-x))));
                 out[row * n + col] = activated * up_acc[r][cc];
+            }
+        }
+}
+
+__global__ void k_matmul_pair_bias_register_blocked(
+    const float* __restrict__ a,
+    const float* __restrict__ first_weight,
+    const float* __restrict__ first_bias,
+    float* __restrict__ first_out,
+    const float* __restrict__ second_weight,
+    const float* __restrict__ second_bias,
+    float* __restrict__ second_out,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ float As[BIG_BM][BIG_BK + 1];
+    __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t row0 =
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM + ty * BIG_TM;
+    const std::size_t col0 =
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * BIG_TN;
+    float first_acc[BIG_TM][BIG_TN] = {};
+    float second_acc[BIG_TM][BIG_TN] = {};
+
+    for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lr = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t row =
+                static_cast<std::size_t>(blockIdx.y) * BIG_BM + lr;
+            const std::size_t p = p0 + lp;
+            As[lr][lp] = row < m && p < k ? a[row * k + p] : 0.0f;
+        }
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? first_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    first_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        __syncthreads();
+
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? second_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    second_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < BIG_TN; ++cc) {
+            const std::size_t row = row0 + r;
+            const std::size_t col = col0 + cc;
+            if (row < m && col < n) {
+                first_out[row * n + col] =
+                    first_acc[r][cc] + first_bias[col];
+                second_out[row * n + col] =
+                    second_acc[r][cc] + second_bias[col];
             }
         }
 }
@@ -1538,10 +1736,17 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
         const dim3 grid(
             static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
             static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
-        k_matmul_transposed_register_blocked<<<grid, block>>>(
-            da, db, dc, m, k, n);
-        check_cuda(cudaGetLastError(),
-                   "k_matmul_transposed_register_blocked launch");
+        if (k % BIG_BK == 0) {
+            k_matmul_transposed_register_blocked_async<<<grid, block>>>(
+                da, db, dc, m, k, n);
+            check_cuda(cudaGetLastError(),
+                       "k_matmul_transposed_register_blocked_async launch");
+        } else {
+            k_matmul_transposed_register_blocked<<<grid, block>>>(
+                da, db, dc, m, k, n);
+            check_cuda(cudaGetLastError(),
+                       "k_matmul_transposed_register_blocked launch");
+        }
     } else {
         const dim3 block(TILE, TILE);
         const dim3 grid(
@@ -1577,6 +1782,39 @@ void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
         out.cuda_data_write(), m, k, n);
     check_cuda(cudaGetLastError(),
                "k_matmul_pair_silu_register_blocked launch");
+}
+
+void matmul_pair_bias_gpu(const Tensor& a,
+                          const Tensor& first_weight,
+                          const Tensor& first_bias, Tensor& first_out,
+                          const Tensor& second_weight,
+                          const Tensor& second_bias, Tensor& second_out) {
+    const std::size_t k = a.size(a.ndim() - 1);
+    const std::size_t m = a.size() / k;
+    const std::size_t n = first_weight.size(0);
+    if (first_weight.size(1) != k || second_weight.size(0) != n ||
+        second_weight.size(1) != k || first_bias.size() != n ||
+        second_bias.size() != n || first_out.size(0) != m ||
+        first_out.size(1) != n || second_out.size(0) != m ||
+        second_out.size(1) != n)
+        throw std::invalid_argument("matmul_pair_bias_gpu shape");
+    if (m < BIG_BM || n < BIG_BN) {
+        matmul_transposed_gpu(a, first_weight, first_out);
+        add_bias_inplace_gpu(first_out, first_bias);
+        matmul_transposed_gpu(a, second_weight, second_out);
+        add_bias_inplace_gpu(second_out, second_bias);
+        return;
+    }
+    const dim3 block(BIG_BX, BIG_BY);
+    const dim3 grid(
+        static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
+        static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
+    k_matmul_pair_bias_register_blocked<<<grid, block>>>(
+        a.cuda_data(), first_weight.cuda_data(), first_bias.cuda_data(),
+        first_out.cuda_data_write(), second_weight.cuda_data(),
+        second_bias.cuda_data(), second_out.cuda_data_write(), m, k, n);
+    check_cuda(cudaGetLastError(),
+               "k_matmul_pair_bias_register_blocked launch");
 }
 
 void add_inplace_gpu(Tensor& a, const Tensor& b) {

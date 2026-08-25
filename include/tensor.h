@@ -71,6 +71,11 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c);   // [M,K] 
 void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c);
 void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
                           const Tensor& up_weight, Tensor& out);
+void matmul_pair_bias_gpu(const Tensor& a,
+                          const Tensor& first_weight,
+                          const Tensor& first_bias, Tensor& first_out,
+                          const Tensor& second_weight,
+                          const Tensor& second_bias, Tensor& second_out);
 void zero_gpu(Tensor& x);
 void add_inplace_gpu(Tensor& a, const Tensor& b);
 void add_bias_inplace_gpu(Tensor& a, const Tensor& bias);

@@ -13,6 +13,8 @@ public:
     Linear() = default;
     Linear(const ModelLoader& loader, const std::string& weight, const std::string& bias = "");
     void forward(const Tensor& x, Tensor& y, bool use_gpu = false) const;
+    const Tensor& weight() const { return weight_; }
+    const Tensor& bias() const { return bias_; }
 private:
     Tensor weight_;
     Tensor bias_;

@@ -346,3 +346,69 @@ split-BF16 빌드의 최종 중앙값은 5.644809초다. grouped-GQA만 적용�
 384ms(6.38%) 줄었다. 초기 device plan은 Nsight에서 32회 합계 0.075037초였고,
 integer count와 256-thread ballot/prefix stable compaction으로 바꾼 뒤 전체
 시간이 추가로 약 54ms 감소했다. 사용자 요청에 따라 제출하지 않았다.
+
+## K/V projection fusion 및 FP32 cp.async pipeline
+
+### K/V A-tile 공유 fusion
+
+Layer 0–30의 K/V projection은 같은 normalized input을 읽고 출력 크기도 각각
+512로 같다. 한 block이 K 64 columns와 V 64 columns의 accumulator를 함께
+유지하도록 만들어 다음 접근을 공유했다.
+
+```text
+for K tile:
+    A[64,32] 1회 shared load
+    K weight[64,32] load → K accumulator
+    V weight[64,32] load → V accumulator
+store: K/V bias addition까지 fusion
+```
+
+Layer 31 K/V는 검증된 split-BF16 Tensor Core 경로를 유지했다. 이에 따라
+기존 FP32 projection kernel 124회는 Q/O 62회 + fused K/V 31회, 총 93회로
+줄었고 K/V bias kernel 62회도 제거됐다.
+
+| 구성 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| K/V fusion | 64 | 0.393299 | 162.725885 | PASSED |
+| K/V fusion 1차 | 1024 | 5.607393 | 182.616068 | PASSED |
+| 반복 1 | 1024 | 5.623026 | 182.108357 | PASSED |
+| 반복 2 | 1024 | 5.644586 | 181.412775 | PASSED |
+
+반복 중앙값은 5.623026초로 직전 host-free MoE 중앙값 5.644809초보다 약
+22ms 개선됐다. Nsight에서 Q/O single GEMM 62회는 1.699727초, fused K/V
+31회는 0.451835초였다. Dual accumulator의 register pressure 때문에 projection
+kernel 합계 자체는 소폭 늘었지만 A load, launch, bias read/write 제거가 전체
+시간을 줄였다.
+
+### 채택: Q/O FP32 GEMM cp.async
+
+Q/O FP32 register GEMM에 2-stage `cp.async` pipeline을 적용했다.
+
+- 현재 tile을 계산하는 동안 다음 A/B `[64,32]` tile을 비동기 적재한다.
+- 16-byte vector copy를 위해 shared stride를 32로 두고, B는 4-float chunk
+  단위 XOR swizzle로 bank conflict를 줄였다.
+- Boundary M row는 `cp.async`의 zero-fill source size로 처리한다.
+- Output별 K 누적 순서는 기존과 동일하다.
+- K가 32의 배수가 아닌 일반 입력은 기존 synchronous kernel로 fallback한다.
+
+| 구성 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| Q/O cp.async | 64 | 0.378402 | 169.132288 | PASSED |
+| Q/O cp.async 1차 | 1024 | 5.456281 | 187.673605 | PASSED |
+| 반복 1 | 1024 | 5.440426 | 188.220561 | PASSED |
+| 반복 2 | 1024 | 5.415901 | 189.072881 | PASSED |
+| 정리 후 재검증 | 1024 | 5.398133 | 189.695219 | PASSED |
+| 최종 USE_TC 재빌드 | 1024 | 5.402435 | 189.544147 | PASSED |
+| 기본 FP32 빌드 | 64 | 0.387846 | 165.014156 | PASSED |
+| 기본 FP32 빌드 | 1024 | 5.472922 | 187.102987 | PASSED |
+
+Nsight에서 Q/O kernel 62회 합계가 synchronous 1.699727초에서 asynchronous
+1.512656초로 약 187ms 감소했다.
+
+### 폐기: fused K/V cp.async
+
+K/V fusion은 A와 두 weight의 double buffer가 필요해 shared memory를 정확히
+48KB 사용했다. 이로 인한 occupancy 하락이 overlap 이득보다 커 n=64가
+0.378402초에서 0.454527초로 느려졌다. K/V는 16KB shared memory를 사용하는
+synchronous fused kernel로 복구했다. 사용자 요청에 따라 이 조합 역시 대회에
+제출하지 않았다.
