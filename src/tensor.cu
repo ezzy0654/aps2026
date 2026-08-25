@@ -548,6 +548,9 @@ __global__ void k_matmul_transposed_bf16_wmma(
             wmma::load_matrix_sync(bf_lo, b_lo + packed_tile, 16);
             wmma::mma_sync(acc[nn], af_hi, bf_lo, acc[nn]);
             wmma::mma_sync(acc[nn], af_lo, bf_hi, acc[nn]);
+#ifdef USE_TC_ALL
+            wmma::mma_sync(acc[nn], af_lo, bf_lo, acc[nn]);
+#endif
         }
         __syncthreads();
     }

@@ -412,3 +412,19 @@ K/V fusion은 A와 두 weight의 double buffer가 필요해 shared memory를 정
 0.378402초에서 0.454527초로 느려졌다. K/V는 16KB shared memory를 사용하는
 synchronous fused kernel로 복구했다. 사용자 요청에 따라 이 조합 역시 대회에
 제출하지 않았다.
+
+## 전체 attention Tensor Core 확대 실험
+
+`USE_TC_ALL` 실험 빌드에서 layer 0–31의 Q/K/V/O weight까지 split-BF16
+pre-pack해 attention projection 124개를 Tensor Core로 실행했다. 기존 채택
+경로의 마지막 layer 제한을 제거한 정확도 경계 실험이다.
+
+| 구성 | n | 시간(초) | 최대 절대 오차 | 검증 |
+|---|---:|---:|---:|---|
+| 전체 attention, split 3항 | 64 | 0.368914 | 0.29916 | FAILED |
+| 전체 attention, split 4항 | 64 | 0.393465 | 0.29916 | FAILED |
+
+네 번째 `Alo*Blo` 항은 표현 절삭 오차를 줄여도 결과를 바꾸지 못했다. 따라서
+주된 원인은 Tensor Core FP32 accumulator의 연산 순서 차이가 여러 layer를 거쳐
+MoE top-2 routing을 바꾸는 것이다. 이 실험은 n=1024 성능 측정과 제출을 하지
+않고 폐기했으며, 기존의 LM head + layer 31 attention 제한 경로를 유지한다.

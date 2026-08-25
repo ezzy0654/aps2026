@@ -17,7 +17,12 @@ Linear::Linear(const ModelLoader& loader, const std::string& weight, const std::
     // Restrict approximation to the terminal region so no later decoder
     // layer can amplify it through another attention/router chain.
     const bool terminal_tc = weight == "lm_head.weight" ||
+#ifdef USE_TC_ALL
+        (weight.find("model.layers.") == 0 &&
+         weight.find(".self_attn.") != std::string::npos);
+#else
         weight.find("model.layers.31.self_attn.") == 0;
+#endif
     if (terminal_tc) weight_.prepare_cuda_bf16_weight(true);
 #endif
 }
