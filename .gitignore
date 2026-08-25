@@ -1,0 +1,14 @@
+# 빌드 산출물
+obj/
+main
+*.o
+
+# 실행 결과 (126MB, GitHub 100MB 제한 초과)
+outputs.bin
+
+# 제출 스크립트 임시 파일
+.submit.sh.*
+
+# 파이썬 가상환경 (tools/set_env.sh 가 만듦)
+.venv/
+__pycache__/
