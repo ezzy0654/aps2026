@@ -575,3 +575,50 @@ kernel 밖 시간을 전부 없애도 상한은 약 3.80초, 253 seq/s다. 그 �
 kernel 자체를 빠르게 하는 방법밖에 없다.
 
 사용자 요청에 따라 이 버전도 대회에 제출하지 않았다.
+
+## Tensor Core 적용 현황 점검
+
+### 빌드 위생 문제
+
+`make`는 `USE_TC` 여부와 무관하게 같은 `obj/*.o` 경로를 쓴다. 앞선 attention과
+embedding 실험에서 `obj/layer.o`는 이전 `make USE_TC=1` 빌드가 남긴 것이었고
+`obj/tensor.o`와 `obj/model.o`만 `-DUSE_TC` 없이 재컴파일됐다. 그 결과:
+
+- `layer.cu`의 `Linear` 생성자는 `USE_TC`가 켜진 상태로 BF16 pre-pack을 수행하고
+  `prepare_cuda_bf16_weight()`가 FP32 device 사본을 `cudaFreeAsync` 한다.
+- `tensor.cu` 1730행의 WMMA dispatch는 `#ifdef USE_TC`라 컴파일에서 빠졌다.
+- 따라서 해당 weight는 BF16으로 pack된 뒤 사용되지 않고, FP32 kernel이
+  `cuda_data()`를 호출해 host에서 FP32를 다시 업로드했다.
+
+결과는 정확했지만 pack 작업과 재업로드가 낭비였다. `USE_TC`를 바꿀 때는 반드시
+`make clean`을 먼저 해야 한다. 두 실험의 A/B는 양쪽이 동일한 빌드 상태였으므로
+delta는 유효하고, 절대값만 이 낭비를 포함한 값이었다.
+
+### Clean build 비교
+
+노드 b0, n=1024, 번갈아 3회.
+
+| 빌드 | 시간(초) | 처리량(seq/s) | 최대 절대 오차 | 검증 |
+|---|---:|---:|---:|---|
+| `make` (FP32) | 4.151432 | 246.661870 | 0.0045929 | PASSED |
+| `make USE_TC=1` | 4.128762 | 248.016261 | 0.00369644 | PASSED |
+| `make` (FP32) | 4.148596 | 246.830477 | 0.0045929 | PASSED |
+| `make USE_TC=1` | 4.140954 | 247.286009 | 0.00369644 | PASSED |
+| `make` (FP32) | 4.149021 | 246.805219 | 0.0045929 | PASSED |
+| `make USE_TC=1` | 4.133062 | 247.758178 | 0.00369644 | PASSED |
+
+### 적용 범위
+
+현재 Tensor Core로 실행되는 weight는 5개뿐이다.
+
+- `lm_head.weight`
+- `model.layers.31.self_attn.{q,k,v,o}_proj.weight`
+
+전체 GEMM weight는 1697개(layer당 attention 4 + router 1 + expert 16×3, 그리고
+lm_head)이므로 적용률은 0.3%다. 이득이 약 15ms, 0.35%인 것은 이 범위 때문이지
+Tensor Core 자체의 한계가 아니다.
+
+layer 31 attention과 lm_head로 범위를 제한한 이유는 앞선 `USE_TC_ALL` 실험에서
+attention 전체로 확대하면 최대 절대 오차가 0.29916으로 검증에 실패했기
+때문이다. 남은 1692개 GEMM을 Tensor Core로 옮기는 것이 유일하게 남은 큰
+레버이며, 병목은 속도가 아니라 MoE top-2 routing을 보존하는 정확도다.
