@@ -824,3 +824,98 @@ IDENTICAL이다.
 출력은 IDENTICAL이었으나 약 36ms 회귀라 폐기했다. stall 분해를 보면
 `k_moe_pair_silu_grouped`의 shared stall은 1.6%에 불과했고 실제 병목은 global
 15.8%였다. counter 절대값이 크다고 critical path인 것이 아니다.
+
+## GEMM 타일 확장 (thread당 accumulator 16 → 32)
+
+### 진단
+
+n=1024 재프로파일 결과 GEMM이 GPU busy의 84%였고, 커널별 실효 성능이
+전부 14 TFLOPS 근처로 균일했다.
+
+| kernel | 연산량(TFLOP) | 시간(ms) | 실효 |
+|---|---:|---:|---:|
+| Q/O projection | 20.60 | 1381.2 | 14.9 TFLOPS |
+| MoE W1/W3 | 9.30 | 692.6 | 13.4 TFLOPS |
+| K/V projection | 5.15 | 373.0 | 13.8 TFLOPS |
+| MoE W2 | 4.65 | 319.1 | 14.6 TFLOPS |
+| 합계 | 39.79 | 2813.8 | 14.1 TFLOPS |
+
+RTX 3090 FP32 peak 35.6 TFLOPS 대비 40%다. 특정 kernel이 느린 것이 아니라
+모든 GEMM이 같은 tile 구조를 공유해 같은 한계에 걸려 있었다.
+
+원인은 산술 강도다. thread당 accumulator가 `BIG_TM x BIG_TN = 8 x 2 = 16`이라
+K step마다 A를 8개, B를 2개 읽어 16 FMA를 한다. shared load 0.625회/FMA다.
+
+### 채택: N tile을 128로
+
+`WIDE_BN = 128`, `WIDE_TN = 4`로 thread당 accumulator를 32개로 늘렸다.
+K step마다 A 8개 + B 4개로 32 FMA, 0.375회/FMA다. B 값은 K step마다 register로
+한 번 올려 8개 row가 재사용한다. cp.async 2-stage와 XOR swizzle, K 누적 순서는
+그대로다.
+
+| kernel | N | regs | shared | 결과 |
+|---|---:|---:|---:|---|
+| Q/O projection | 2048 / 4096 | 128, spill 0 | 48.0 KB | 3.688039 → 3.481855초 |
+| MoE W2 | 4096 | 128, spill 0 | 48.0 KB | 3.527453 → 3.482493초 |
+| K/V projection | 512 | 128, spill 32B | 41.25 KB | 3.481 → 3.457초 |
+
+static shared 상한이 block당 48 KB라 `BIG_BK`를 32로 유지한 채 N만 128까지
+늘릴 수 있었다. `BIG_BM`까지 키우면 상한을 넘는다.
+
+K/V는 두 출력이 있어 accumulator가 64개다. `__launch_bounds__` 없이는 ptxas가
+158 regs를 잡아 SM당 block이 1개로 떨어지고 오히려 느렸다(3.525초). bound를
+걸어 128 regs + stack 32B spill로 block 2개를 유지하는 쪽이 빨랐다.
+
+| 구성 | n=1024 시간(초) |
+|---|---:|
+| K/V 64-wide (baseline) | 3.481 |
+| K/V 128-wide, 158 regs, 1 block/SM | 3.525 |
+| K/V 128-wide, 128 regs + 32B spill, 2 block/SM | 3.457 |
+
+### 폐기: MoE W1/W3 타일 확장
+
+`EXPERT_INTERMEDIATE_SIZE`가 448이라 128의 배수가 아니다. tile 4개가 512열을
+덮어 12.5%가 낭비되고, spill까지 겹쳐 느려졌다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| baseline | 3.395747 | 301.553672 |
+| W1/W3 128-wide | 3.437604 | 297.881865 |
+
+약 42ms 회귀라 폐기했다. 이 kernel은 64-wide를 유지한다.
+
+### 누적
+
+| 단계 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| 세션 시작 | 5.402435 | 189.544147 |
+| clean USE_TC 재빌드 | 4.133062 | 247.758178 |
+| W2 cp.async | 4.065078 | 251.901701 |
+| dual B tile | 3.912432 | 261.729773 |
+| occupancy (launch_bounds + carveout) | 3.698225 | 276.889572 |
+| attention key tile | 3.726404 | 274.795783 |
+| Q/O 128-wide | 3.481855 | 294.096134 |
+| MoE W2 128-wide | 3.482493 | 294.042269 |
+| K/V 128-wide | 3.395747 | 301.553672 |
+
+세션 시작 대비 1.59배다. 사용자 요청에 따라 제출하지 않았다.
+
+### Tensor Core 상한 정정
+
+이전 기록에서 "600 seq/s는 compensated TF32로만 가능하다"고 적었으나 잘못된
+성능표에 근거한 것이었다. RTX 3090(GA102)의 실제 값은 다음과 같다.
+
+| 경로 | 이론 최대 |
+|---|---:|
+| FP32 CUDA core | 35.6 TFLOPS |
+| TF32 Tensor Core | 35.6 TFLOPS |
+| BF16 Tensor Core (FP32 accumulate) | 71 TFLOPS |
+
+TF32는 이 카드에서 FP32와 동일하고, 보정하면 MMA를 3회 해야 하므로 오히려
+느리다. BF16은 2배지만 3항 보정이 그 이득을 나눠 상한이 23.7 TFLOPS다.
+실제로 기존 `k_matmul_transposed_bf16_wmma` 경로는 1.0996 TFLOP를 70.3ms에
+처리해 15.6 TFLOPS로, FP32 경로 14.1 TFLOPS 대비 11%만 빠르다.
+
+600 seq/s(1.707초)는 GEMM에 0.783초만 허용하므로 50.8 TFLOPS가 필요하다.
+검증을 유지하는 어떤 경로도 이 값에 도달하지 못한다. 현실적인 상한은
+330~350 seq/s다.
