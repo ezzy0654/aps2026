@@ -622,3 +622,70 @@ layer 31 attention과 lm_head로 범위를 제한한 이유는 앞선 `USE_TC_AL
 attention 전체로 확대하면 최대 절대 오차가 0.29916으로 검증에 실패했기
 때문이다. 남은 1692개 GEMM을 Tensor Core로 옮기는 것이 유일하게 남은 큰
 레버이며, 병목은 속도가 아니라 MoE top-2 routing을 보존하는 정확도다.
+
+## FP32 GEMM 잔여 최적화 3종
+
+Tensor Core 확대 전에, 검증 리스크가 없는 FP32 경로만 먼저 깎았다. 세 실험 모두
+K 누적 순서를 바꾸지 않으므로 출력이 bit 단위로 같아야 하고, 실제로 세 경우 모두
+n=1024 출력 binary가 IDENTICAL이었다.
+
+### 채택: MoE W2 grouped GEMM에 cp.async
+
+expert output projection은 cp.async가 걸리지 않은 마지막 단일 weight GEMM이었다.
+Q/O가 쓰던 2-stage double buffer와 4-float XOR swizzle을 그대로 적용했다.
+`EXPERT_INTERMEDIATE_SIZE`가 448로 `BIG_BK`의 배수라 모든 tile이 꽉 차고
+16-byte 정렬도 유지된다. 다른 K는 기존 synchronous kernel로 fallback한다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| baseline | 4.112822 | 248.977464 |
+| W2 cp.async | 4.065078 | 251.901701 |
+
+### 폐기: synchronous kernel의 global load 벡터화
+
+`[BIG_BK + 1]` padding을 유지한 채 global 쪽만 `float4`로 읽고 shared 저장은
+scalar로 두는 staging helper를 만들어 pair kernel 6곳에 적용했다. 결과는 오히려
+368ms 느렸다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| W2 cp.async | 4.119617 | 248.566785 |
+| + global load 벡터화 | 4.487814 | 228.173436 |
+
+shared 배열을 `float dst[][BIG_BK + 1]` 형태로 `__device__` 함수에 넘기면서
+shared state space가 소실돼 generic addressing으로 컴파일된 것이 유력한 원인이다.
+출력은 IDENTICAL이었으나 성능 회귀라 폐기했다.
+
+### 채택: pair kernel에 weight별 shared tile 분리
+
+`k_moe_pair_silu_grouped`와 `k_matmul_pair_bias_register_blocked`는 shared `Bs`
+하나를 두 weight가 번갈아 쓰고 있었다. 그래서 K tile마다 `__syncthreads()`가
+4번 필요했고, A 값도 weight마다 한 번씩 두 번 읽었다.
+
+weight마다 shared tile을 따로 두고 두 개를 모두 적재한 뒤 하나의 barrier로
+넘어가게 바꿨다.
+
+- K tile당 barrier 4회 → 2회
+- A 값은 `(p, r)`마다 shared에서 1회만 읽음
+- shared 사용량 16.9KB → 25.3KB (SM당 block 5개 → 3개)
+- 각 accumulator의 K 누적 순서는 그대로
+
+occupancy가 내려가는데도 barrier 절감이 더 컸다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| W2 cp.async | 4.120179 | 248.532871 |
+| + dual B tile | 3.912432 | 261.729773 |
+
+### 누적 결과
+
+| 단계 | n=1024 시간(초) | 처리량(seq/s) |
+|---|---:|---:|
+| 세션 시작 | 5.402435 | 189.544147 |
+| attention Q-head 4-way | — | — |
+| embedding row memcpy | — | — |
+| clean USE_TC 재빌드 | 4.133062 | 247.758178 |
+| W2 cp.async | 4.065078 | 251.901701 |
+| dual B tile | 3.912432 | 261.729773 |
+
+세션 시작 대비 1.38배다. 사용자 요청에 따라 제출하지 않았다.

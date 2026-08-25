@@ -803,8 +803,12 @@ __global__ void k_matmul_pair_bias_register_blocked(
     const float* __restrict__ second_bias,
     float* __restrict__ second_out,
     std::size_t m, std::size_t k, std::size_t n) {
+    // One shared tile per weight, staged before a single barrier: two
+    // __syncthreads() per K tile instead of four, and one shared read of each
+    // A value instead of one per weight.
     __shared__ float As[BIG_BM][BIG_BK + 1];
     __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    __shared__ float Bs2[BIG_BN][BIG_BK + 1];
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * BIG_BX + tx;
@@ -834,27 +838,7 @@ __global__ void k_matmul_pair_bias_register_blocked(
             const std::size_t p = p0 + lp;
             Bs[lc][lp] = col < n && p < k
                 ? first_weight[col * k + p] : 0.0f;
-        }
-        __syncthreads();
-#pragma unroll
-        for (int p = 0; p < BIG_BK; ++p)
-#pragma unroll
-            for (int r = 0; r < BIG_TM; ++r) {
-                const float av = As[ty * BIG_TM + r][p];
-#pragma unroll
-                for (int cc = 0; cc < BIG_TN; ++cc)
-                    first_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
-            }
-        __syncthreads();
-
-        for (int idx = tid; idx < BIG_BN * BIG_BK;
-             idx += BIG_BX * BIG_BY) {
-            const int lc = idx / BIG_BK;
-            const int lp = idx % BIG_BK;
-            const std::size_t col =
-                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
-            const std::size_t p = p0 + lp;
-            Bs[lc][lp] = col < n && p < k
+            Bs2[lc][lp] = col < n && p < k
                 ? second_weight[col * k + p] : 0.0f;
         }
         __syncthreads();
@@ -864,8 +848,11 @@ __global__ void k_matmul_pair_bias_register_blocked(
             for (int r = 0; r < BIG_TM; ++r) {
                 const float av = As[ty * BIG_TM + r][p];
 #pragma unroll
-                for (int cc = 0; cc < BIG_TN; ++cc)
-                    second_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+                for (int cc = 0; cc < BIG_TN; ++cc) {
+                    const int lc = tx * BIG_TN + cc;
+                    first_acc[r][cc] += av * Bs[lc][p];
+                    second_acc[r][cc] += av * Bs2[lc][p];
+                }
             }
         __syncthreads();
     }
@@ -1080,8 +1067,12 @@ __global__ void k_moe_pair_silu_grouped(
     if (expert >= apss26::NUM_EXPERTS) return;
     const std::size_t start = work_start[wi];
     const std::size_t end = offsets[expert + 1];
+    // One shared tile per weight. Staging both before a single barrier
+    // halves the __syncthreads() count per K tile (4 -> 2) and lets each A
+    // value be read from shared once instead of once per weight.
     __shared__ float As[BIG_BM][BIG_BK + 1];
     __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    __shared__ float Bs2[BIG_BN][BIG_BK + 1];
     const int tx = threadIdx.x, ty = threadIdx.y;
     const int tid = ty * BIG_BX + tx;
     const std::size_t row0 = start + ty * BIG_TM;
@@ -1106,25 +1097,7 @@ __global__ void k_moe_pair_silu_grouped(
             const std::size_t p = p0 + lp;
             Bs[lc][lp] = col < n && p < k
                 ? gate_weight[col * k + p] : 0.0f;
-        }
-        __syncthreads();
-#pragma unroll
-        for (int p = 0; p < BIG_BK; ++p)
-#pragma unroll
-            for (int r = 0; r < BIG_TM; ++r) {
-                const float av = As[ty * BIG_TM + r][p];
-#pragma unroll
-                for (int cc = 0; cc < BIG_TN; ++cc)
-                    gate_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
-            }
-        __syncthreads();
-        for (int idx = tid; idx < BIG_BN * BIG_BK;
-             idx += BIG_BX * BIG_BY) {
-            const int lc = idx / BIG_BK, lp = idx % BIG_BK;
-            const std::size_t col =
-                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
-            const std::size_t p = p0 + lp;
-            Bs[lc][lp] = col < n && p < k
+            Bs2[lc][lp] = col < n && p < k
                 ? up_weight[col * k + p] : 0.0f;
         }
         __syncthreads();
@@ -1134,8 +1107,11 @@ __global__ void k_moe_pair_silu_grouped(
             for (int r = 0; r < BIG_TM; ++r) {
                 const float av = As[ty * BIG_TM + r][p];
 #pragma unroll
-                for (int cc = 0; cc < BIG_TN; ++cc)
-                    up_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+                for (int cc = 0; cc < BIG_TN; ++cc) {
+                    const int lc = tx * BIG_TN + cc;
+                    gate_acc[r][cc] += av * Bs[lc][p];
+                    up_acc[r][cc] += av * Bs2[lc][p];
+                }
             }
         __syncthreads();
     }
