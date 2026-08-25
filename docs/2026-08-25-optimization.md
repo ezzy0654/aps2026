@@ -498,3 +498,80 @@ attention kernel은 390.6ms에서 112.0ms로 3.49배 빨라졌고 278.6ms를 줄
 GEMM(전체의 약 84%)과 kernel 사이 공백 시간이다.
 
 사용자 요청에 따라 이 버전은 대회에 제출하지 않았다.
+
+## CUDA Graph 검토와 host embedding gather 병목
+
+### CUDA Graph는 이득이 없다
+
+launch overhead를 nsys로 직접 측정했다.
+
+- `cudaLaunchKernel` 620회 합계 11.0 ms
+- inference kernel 615개 사이의 GPU idle 합계 210 ms
+- 그중 200.2 ms는 첫 GEMM 앞의 단일 gap(layer 0 attention weight H2D + memory
+  pool 확장)이고, 3.5/3.2/0.8/0.8 ms 4개를 빼면 나머지 약 610개 gap의 합은 2 ms다.
+
+CUDA Graph가 없앨 수 있는 것은 이 마지막 2 ms뿐이므로 전체의 0.05%다. MoE가
+device-side work queue를 쓰고 grid 크기가 batch에 대해 고정이라 capture 자체는
+가능하지만, 실익이 없어 착수하지 않았다.
+
+### 정정: kernel 밖 공백은 1.5초가 아니었다
+
+이전 기록에서 "kernel 합계 3821 ms vs 실측 5350 ms이므로 약 1.5초가 kernel 밖
+공백"이라고 적었으나 두 값이 서로 다른 노드에서 측정된 잘못된 비교였다. 같은
+노드에서 다시 측정한 결과는 다음과 같다.
+
+| 구성 | n=1024 시간(초) |
+|---|---:|
+| cold | 5.353665 |
+| warm (`-w`) | 5.155582 |
+
+차이는 198 ms이며 위 gap 분석의 210 ms와 일치한다. GPU는 이미 포화 상태였다.
+
+또한 MoE expert weight 약 11.3 GB는 `PhiMoE` 생성자의
+`register_moe_weights_gpu()`가 `cuda_data()`를 호출하면서 이미 timed region
+밖에서 업로드되고 있다. timed region 안에 남은 H2D는 attention weight와
+lm_head 약 3.3 GB뿐이고 그것이 위 200 ms gap의 실체다.
+
+### 채택: embedding gather를 row memcpy로
+
+`generate()`의 embedding gather가 `Tensor::at()`를 원소마다 호출하고 있었다.
+`at()`은 원소마다 `ensure_host()`와 rank 검사·범위 검사가 있는
+`offset(initializer_list)`를 수행한다. total_tokens × HIDDEN_SIZE 약 8500만
+원소를 읽기와 쓰기 양쪽에서 그렇게 접근했다.
+
+- 두 base pointer를 한 번만 해석하고 행 단위 `std::memcpy`로 교체했다.
+- token 범위 검사는 행 단위로 그대로 유지했다.
+- 행끼리 독립이므로 OpenMP로 병렬화했다.
+- 기록되는 바이트는 완전히 동일하다.
+
+이 구간은 GPU kernel 프로파일에 전혀 나타나지 않는 순수 host 시간이라 지금까지
+발견되지 않았다.
+
+| 구성 | n=1024 시간(초) | 처리량(seq/s) | 최대 절대 오차 | 검증 |
+|---|---:|---:|---:|---|
+| baseline | 1024 | 5.354890 | 191.227075 | 0.0045929 | PASSED |
+| row memcpy | 1024 | 4.300023 | 238.138264 | 0.0045929 | PASSED |
+| baseline | 1024 | 5.348384 | 191.459696 | 0.0045929 | PASSED |
+| row memcpy | 1024 | 4.307282 | 237.736918 | 0.0045929 | PASSED |
+| baseline | 1024 | 5.343864 | 191.621657 | 0.0045929 | PASSED |
+| row memcpy | 1024 | 4.305678 | 237.825489 | 0.0045929 | PASSED |
+
+출력 binary는 baseline과 IDENTICAL이다. 중앙값 5.348384초에서 4.305678초로
+약 1.04초, 19.5% 단축됐다.
+
+### 변경 후 예산
+
+노드 b6, n=1024 기준이다.
+
+| 항목 | 시간 |
+|---|---:|
+| 실측 elapsed | 4321 ms |
+| inference kernel span | 4006 ms |
+| GPU busy | 3796 ms (87.9%) |
+| kernel 사이 gap | 210 ms (그중 200 ms는 attention weight H2D 단일 gap) |
+| kernel span 밖 host 구간 | 315 ms |
+
+kernel 밖 시간을 전부 없애도 상한은 약 3.80초, 253 seq/s다. 그 이상은 GEMM
+kernel 자체를 빠르게 하는 방법밖에 없다.
+
+사용자 요청에 따라 이 버전도 대회에 제출하지 않았다.

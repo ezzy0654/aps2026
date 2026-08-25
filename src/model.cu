@@ -1,6 +1,8 @@
 #include "model.h"
 #include "config.h"
+#include <cstring>
 #include <stdexcept>
+#include <vector>
 
 PhiTinyMoEModel::PhiTinyMoEModel(const std::string& model_file)
     : loader_(model_file),
@@ -56,14 +58,27 @@ void PhiTinyMoEModel::generate(
         total += len;
     }
 
+    // Embedding gather is a pure row copy. Going through Tensor::at() runs
+    // ensure_host() plus a bounds-checked offset() for every one of the
+    // total_tokens * HIDDEN_SIZE elements, which dominated the host side of
+    // the timed region. Resolve the two base pointers once and copy whole
+    // rows instead; the bytes written are identical.
     Tensor hidden({total, apss26::HIDDEN_SIZE});
+    float* hidden_rows = hidden.data();
+    const float* embedding_rows = embeddings_.data();
+    std::vector<std::size_t> row_tokens(total);
     for (std::size_t b = 0; b < batch; ++b) {
         for (std::size_t si = 0; si < seq_lens[b]; ++si) {
             const int token = input_ids[b][si];
             if (token < 0 || static_cast<std::size_t>(token) >= apss26::VOCAB_SIZE) throw std::invalid_argument("token out of vocabulary");
-            const std::size_t row = offsets[b] + si;
-            for (std::size_t h = 0; h < apss26::HIDDEN_SIZE; ++h) hidden.at(row, h) = embeddings_.at(static_cast<std::size_t>(token), h);
+            row_tokens[offsets[b] + si] = static_cast<std::size_t>(token);
         }
+    }
+#pragma omp parallel for schedule(static)
+    for (std::size_t row = 0; row < total; ++row) {
+        std::memcpy(hidden_rows + row * apss26::HIDDEN_SIZE,
+                    embedding_rows + row_tokens[row] * apss26::HIDDEN_SIZE,
+                    apss26::HIDDEN_SIZE * sizeof(float));
     }
 
     for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true); hidden = std::move(next); }
