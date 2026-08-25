@@ -584,6 +584,97 @@ __global__ void k_matmul_transposed_bf16_wmma(
 }
 #endif
 
+// Wider N tile: 64 x 128 output per block instead of 64 x 64, so each thread
+// owns BIG_TM x WIDE_TN = 8 x 4 = 32 accumulators instead of 16. Per K step a
+// thread reads 8 A values and 4 B values for 32 FMAs (0.375 shared loads per
+// FMA) where the 64-wide kernel reads 10 for 16 (0.625). Same two-stage
+// cp.async pipeline, same 4-float XOR swizzle, and the same K order, so the
+// results match k_matmul_transposed_register_blocked_async exactly.
+constexpr int WIDE_BN = 128;
+constexpr int WIDE_TN = WIDE_BN / BIG_BX;
+
+__global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
+k_matmul_transposed_wide_async(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ c,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ __align__(16) float As[2][BIG_BM][BIG_BK];
+    __shared__ __align__(16) float Bs[2][WIDE_BN][BIG_BK];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t block_row =
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * WIDE_BN;
+    const std::size_t row0 = block_row + ty * BIG_TM;
+    const std::size_t col0 = block_col + tx * WIDE_TN;
+    float acc[BIG_TM][WIDE_TN] = {};
+    const std::size_t tiles = k / BIG_BK;
+
+    auto issue = [&](int stage, std::size_t p0) {
+        constexpr int a_vectors = BIG_BM * BIG_BK / 4;
+        for (int vec = tid; vec < a_vectors; vec += BIG_BX * BIG_BY) {
+            const int lr = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const std::size_t row = block_row + lr;
+            const float* src = row < m
+                ? a + row * k + p0 + chunk * 4 : a;
+            cp_async_16(&As[stage][lr][chunk * 4], src,
+                        row < m ? 16 : 0);
+        }
+        constexpr int b_vectors = WIDE_BN * BIG_BK / 4;
+        for (int vec = tid; vec < b_vectors; vec += BIG_BX * BIG_BY) {
+            const int lc = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const int swizzled = chunk ^ ((lc >> 1) & 7);
+            const std::size_t col = block_col + lc;
+            const float* src = col < n
+                ? b + col * k + p0 + chunk * 4 : b;
+            cp_async_16(&Bs[stage][lc][swizzled * 4], src,
+                        col < n ? 16 : 0);
+        }
+        cp_async_commit();
+    };
+
+    issue(0, 0);
+    for (std::size_t tile = 0; tile < tiles; ++tile) {
+        const int stage = tile & 1;
+        if (tile + 1 < tiles) {
+            issue(stage ^ 1, (tile + 1) * BIG_BK);
+            cp_async_wait_one();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p) {
+            float bv[WIDE_TN];
+#pragma unroll
+            for (int cc = 0; cc < WIDE_TN; ++cc) {
+                const int lc = tx * WIDE_TN + cc;
+                const int physical_p =
+                    ((p / 4) ^ ((lc >> 1) & 7)) * 4 + (p & 3);
+                bv[cc] = Bs[stage][lc][physical_p];
+            }
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[stage][ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < WIDE_TN; ++cc)
+                    acc[r][cc] += av * bv[cc];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < WIDE_TN; ++cc) {
+            const std::size_t row = row0 + r, col = col0 + cc;
+            if (row < m && col < n) c[row * n + col] = acc[r][cc];
+        }
+}
+
 __global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
 k_matmul_transposed_register_blocked_async(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -1866,7 +1957,21 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
         const dim3 grid(
             static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
             static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
-        if (k % BIG_BK == 0) {
+        if (k % BIG_BK == 0 && n % WIDE_BN == 0) {
+            static const bool wide_carveout = [] {
+                prefer_shared_carveout(reinterpret_cast<const void*>(
+                    k_matmul_transposed_wide_async));
+                return true;
+            }();
+            (void)wide_carveout;
+            const dim3 wide_grid(
+                static_cast<unsigned>(n / WIDE_BN),
+                static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
+            k_matmul_transposed_wide_async<<<wide_grid, block>>>(
+                da, db, dc, m, k, n);
+            check_cuda(cudaGetLastError(),
+                       "k_matmul_transposed_wide_async launch");
+        } else if (k % BIG_BK == 0) {
             static const bool carveout_set = [] {
                 prefer_shared_carveout(reinterpret_cast<const void*>(
                     k_matmul_transposed_register_blocked_async));
