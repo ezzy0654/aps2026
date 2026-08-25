@@ -979,6 +979,85 @@ __global__ void k_matmul_pair_bias_register_blocked(
         }
 }
 
+__global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
+k_matmul_pair_bias_wide(
+    const float* __restrict__ a,
+    const float* __restrict__ first_weight,
+    const float* __restrict__ first_bias,
+    float* __restrict__ first_out,
+    const float* __restrict__ second_weight,
+    const float* __restrict__ second_bias,
+    float* __restrict__ second_out,
+    std::size_t m, std::size_t k, std::size_t n) {
+    // One shared tile per weight, staged before a single barrier: two
+    // __syncthreads() per K tile instead of four, and one shared read of each
+    // A value instead of one per weight.
+    __shared__ float As[BIG_BM][BIG_BK + 1];
+    __shared__ float Bs[WIDE_BN][BIG_BK + 1];
+    __shared__ float Bs2[WIDE_BN][BIG_BK + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t row0 =
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM + ty * BIG_TM;
+    const std::size_t col0 =
+        static_cast<std::size_t>(blockIdx.x) * WIDE_BN + tx * WIDE_TN;
+    float first_acc[BIG_TM][WIDE_TN] = {};
+    float second_acc[BIG_TM][WIDE_TN] = {};
+
+    for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lr = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t row =
+                static_cast<std::size_t>(blockIdx.y) * BIG_BM + lr;
+            const std::size_t p = p0 + lp;
+            As[lr][lp] = row < m && p < k ? a[row * k + p] : 0.0f;
+        }
+        for (int idx = tid; idx < WIDE_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * WIDE_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? first_weight[col * k + p] : 0.0f;
+            Bs2[lc][lp] = col < n && p < k
+                ? second_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < WIDE_TN; ++cc) {
+                    const int lc = tx * WIDE_TN + cc;
+                    first_acc[r][cc] += av * Bs[lc][p];
+                    second_acc[r][cc] += av * Bs2[lc][p];
+                }
+            }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < WIDE_TN; ++cc) {
+            const std::size_t row = row0 + r;
+            const std::size_t col = col0 + cc;
+            if (row < m && col < n) {
+                first_out[row * n + col] =
+                    first_acc[r][cc] + first_bias[col];
+                second_out[row * n + col] =
+                    second_acc[r][cc] + second_bias[col];
+            }
+        }
+}
+
 struct MoeWeightSet {
     const float** w1 = nullptr;
     const float** w2 = nullptr;
@@ -2151,6 +2230,23 @@ void matmul_pair_bias_gpu(const Tensor& a,
         return;
     }
     const dim3 block(BIG_BX, BIG_BY);
+    if (n % WIDE_BN == 0) {
+        static const bool wide_carveout = [] {
+            prefer_shared_carveout(reinterpret_cast<const void*>(
+                k_matmul_pair_bias_wide));
+            return true;
+        }();
+        (void)wide_carveout;
+        const dim3 wide_grid(
+            static_cast<unsigned>(n / WIDE_BN),
+            static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
+        k_matmul_pair_bias_wide<<<wide_grid, block>>>(
+            a.cuda_data(), first_weight.cuda_data(), first_bias.cuda_data(),
+            first_out.cuda_data_write(), second_weight.cuda_data(),
+            second_bias.cuda_data(), second_out.cuda_data_write(), m, k, n);
+        check_cuda(cudaGetLastError(), "k_matmul_pair_bias_wide launch");
+        return;
+    }
     const dim3 grid(
         static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
         static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
