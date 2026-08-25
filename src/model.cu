@@ -1,6 +1,8 @@
 #include "model.h"
 #include "config.h"
 #include <cstring>
+#include <cstdint>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
@@ -63,25 +65,67 @@ void PhiTinyMoEModel::generate(
     // total_tokens * HIDDEN_SIZE elements, which dominated the host side of
     // the timed region. Resolve the two base pointers once and copy whole
     // rows instead; the bytes written are identical.
-    Tensor hidden({total, apss26::HIDDEN_SIZE});
-    float* hidden_rows = hidden.data();
-    const float* embedding_rows = embeddings_.data();
-    std::vector<std::size_t> row_tokens(total);
-    for (std::size_t b = 0; b < batch; ++b) {
-        for (std::size_t si = 0; si < seq_lens[b]; ++si) {
-            const int token = input_ids[b][si];
-            if (token < 0 || static_cast<std::size_t>(token) >= apss26::VOCAB_SIZE) throw std::invalid_argument("token out of vocabulary");
-            row_tokens[offsets[b] + si] = static_cast<std::size_t>(token);
+    // Prefix deduplication. Attention is causal and the sequences are
+    // independent, so a token's hidden state is a pure function of the prefix
+    // ending at it: two sequences sharing a prefix produce bit-identical rows
+    // there. Collapse the packed token rows onto the nodes of the prefix trie
+    // and run every row-wise op (LayerNorm, projections, MoE) on those. For
+    // this input that is 19,803 token rows -> 15,583 nodes.
+    //
+    // `token_node` maps each token row to its node (the expansion attention
+    // needs); `node_row` maps each node back to one representative token row.
+    // Rows sharing a node are bit-identical, so picking a representative is
+    // exact rather than an average.
+    std::vector<std::size_t> token_node(total), node_token, node_row;
+    node_token.reserve(total);
+    node_row.reserve(total);
+    {
+        std::unordered_map<std::uint64_t, std::uint32_t> children;
+        children.reserve(total * 2);
+        for (std::size_t b = 0; b < batch; ++b) {
+            std::uint32_t parent = 0xFFFFFFFFu;  // virtual root
+            for (std::size_t si = 0; si < seq_lens[b]; ++si) {
+                const int token = input_ids[b][si];
+                if (token < 0 || static_cast<std::size_t>(token) >= apss26::VOCAB_SIZE) throw std::invalid_argument("token out of vocabulary");
+                const std::size_t row = offsets[b] + si;
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(parent + 1u) << 32) |
+                    static_cast<std::uint32_t>(token);
+                auto it = children.find(key);
+                std::uint32_t node;
+                if (it == children.end()) {
+                    node = static_cast<std::uint32_t>(node_token.size());
+                    node_token.push_back(static_cast<std::size_t>(token));
+                    node_row.push_back(row);
+                    children.emplace(key, node);
+                } else {
+                    node = it->second;
+                }
+                token_node[row] = node;
+                parent = node;
+            }
         }
     }
+    const std::size_t nodes = node_token.size();
+
+    Tensor hidden({nodes, apss26::HIDDEN_SIZE});
+    float* hidden_rows = hidden.data();
+    const float* embedding_rows = embeddings_.data();
 #pragma omp parallel for schedule(static)
-    for (std::size_t row = 0; row < total; ++row) {
+    for (std::size_t row = 0; row < nodes; ++row) {
         std::memcpy(hidden_rows + row * apss26::HIDDEN_SIZE,
-                    embedding_rows + row_tokens[row] * apss26::HIDDEN_SIZE,
+                    embedding_rows + node_token[row] * apss26::HIDDEN_SIZE,
                     apss26::HIDDEN_SIZE * sizeof(float));
     }
 
-    for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true); hidden = std::move(next); }
+    const tensor_ops::RowIndexBuffer expand_rows(token_node);
+    const tensor_ops::RowIndexBuffer contract_rows(node_row);
+    PrefixExpansion expansion;
+    expansion.expand = &expand_rows;
+    expansion.contract = &contract_rows;
+    expansion.num_tokens = total;
+
+    for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true, expansion); hidden = std::move(next); }
 
     Tensor normed(hidden.shape());
     tensor_ops::layer_norm_gpu(
@@ -91,7 +135,7 @@ void PhiTinyMoEModel::generate(
     Tensor last({batch, apss26::HIDDEN_SIZE});
     std::vector<std::size_t> last_rows(batch);
     for (std::size_t b = 0; b < batch; ++b)
-        last_rows[b] = offsets[b] + seq_lens[b] - 1;
+        last_rows[b] = token_node[offsets[b] + seq_lens[b] - 1];
     tensor_ops::gather_rows_gpu(normed, last_rows, last);
     lm_head_.forward(last, logits, /*use_gpu=*/true);
     logits.reshape({batch, apss26::VOCAB_SIZE});

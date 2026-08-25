@@ -2366,6 +2366,45 @@ void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,
     check_cuda(cudaGetLastError(), "k_gather_rows launch");
 }
 
+RowIndexBuffer::RowIndexBuffer(const std::vector<std::size_t>& rows)
+    : size_(rows.size()) {
+    if (size_ == 0) return;
+    std::vector<std::uint32_t> compact(rows.begin(), rows.end());
+    check_cuda(cudaMalloc(&ptr_, size_ * sizeof(std::uint32_t)),
+               "cudaMalloc RowIndexBuffer");
+    check_cuda(cudaMemcpy(ptr_, compact.data(),
+                          size_ * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice), "copy RowIndexBuffer");
+}
+
+RowIndexBuffer::~RowIndexBuffer() { if (ptr_) cudaFree(ptr_); }
+
+RowIndexBuffer::RowIndexBuffer(RowIndexBuffer&& other) noexcept
+    : ptr_(other.ptr_), size_(other.size_) {
+    other.ptr_ = nullptr;
+    other.size_ = 0;
+}
+
+RowIndexBuffer& RowIndexBuffer::operator=(RowIndexBuffer&& other) noexcept {
+    if (this != &other) {
+        if (ptr_) cudaFree(ptr_);
+        ptr_ = other.ptr_;
+        size_ = other.size_;
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+    return *this;
+}
+
+void gather_rows_gpu(const Tensor& x, const RowIndexBuffer& rows, Tensor& out) {
+    if (rows.empty()) return;
+    const std::size_t h = x.size(x.ndim() - 1);
+    const std::size_t total = rows.size() * h;
+    k_gather_rows<<<(total + 255) / 256, 256>>>(
+        x.cuda_data(), rows.data(), out.cuda_data_write(), rows.size(), h);
+    check_cuda(cudaGetLastError(), "k_gather_rows(dev) launch");
+}
+
 void scatter_add_rows_gpu(const Tensor& x,
                           const std::vector<std::size_t>& rows,
                           float scale, Tensor& out) {

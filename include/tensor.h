@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,28 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
                    std::size_t head_dim);
 void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,
                      Tensor& out);
+
+// A row-index map uploaded to the device once and reused across many gathers.
+// The std::vector overload above shares one static staging buffer and does a
+// blocking H2D copy per call, which is fine for the single end-of-run gather
+// but would serialize the pipeline if used per layer.
+class RowIndexBuffer {
+public:
+    RowIndexBuffer() = default;
+    explicit RowIndexBuffer(const std::vector<std::size_t>& rows);
+    ~RowIndexBuffer();
+    RowIndexBuffer(const RowIndexBuffer&) = delete;
+    RowIndexBuffer& operator=(const RowIndexBuffer&) = delete;
+    RowIndexBuffer(RowIndexBuffer&& other) noexcept;
+    RowIndexBuffer& operator=(RowIndexBuffer&& other) noexcept;
+    const std::uint32_t* data() const { return ptr_; }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+private:
+    std::uint32_t* ptr_ = nullptr;
+    std::size_t size_ = 0;
+};
+void gather_rows_gpu(const Tensor& x, const RowIndexBuffer& rows, Tensor& out);
 void scatter_add_rows_gpu(const Tensor& x,
                           const std::vector<std::size_t>& rows,
                           float scale, Tensor& out);

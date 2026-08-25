@@ -42,13 +42,29 @@ private:
     void route(const Tensor& logits, std::vector<std::pair<int, float>>& routes) const;
 };
 
+// Prefix deduplication: sequences that share a prefix have bit-identical
+// hidden states there, so the residual stream carries one row per distinct
+// trie node instead of one per token. Every row-wise op (LayerNorm, the
+// projections, MoE) then runs on the deduplicated rows. Attention is the one
+// op that needs the full per-sequence layout, so the Q/K/V it consumes are
+// expanded through `expand` and its result contracted back through
+// `contract`. A default-constructed value (expand == nullptr) means no
+// deduplication and every path behaves exactly as before.
+struct PrefixExpansion {
+    const tensor_ops::RowIndexBuffer* expand = nullptr;    // token row -> node row
+    const tensor_ops::RowIndexBuffer* contract = nullptr;  // node row -> token row
+    std::size_t num_tokens = 0;
+    bool active() const { return expand != nullptr; }
+};
+
 class PhiAttention {
 public:
     PhiAttention(const ModelLoader& loader, std::size_t layer_idx);
     // seq_lens: lengths of the sequences packed along x's row dimension;
     // attention (and RoPE) never crosses a segment boundary. Single-sequence
     // callers pass {x.size(0)}.
-    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false) const;
+    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false,
+                 const PrefixExpansion& expansion = {}) const;
 private:
     Linear q_proj_, k_proj_, v_proj_, o_proj_;
 };
@@ -56,7 +72,8 @@ private:
 class PhiDecoderLayer {
 public:
     PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_idx);
-    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false) const;
+    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false,
+                 const PrefixExpansion& expansion = {}) const;
 private:
     Tensor input_norm_weight_, input_norm_bias_;
     Tensor post_norm_weight_, post_norm_bias_;

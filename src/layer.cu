@@ -150,7 +150,8 @@ PhiAttention::PhiAttention(const ModelLoader& loader, std::size_t layer_idx)
       v_proj_(loader, "model.layers." + std::to_string(layer_idx) + ".self_attn.v_proj.weight", "model.layers." + std::to_string(layer_idx) + ".self_attn.v_proj.bias"),
       o_proj_(loader, "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj.weight", "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj.bias") {}
 
-void PhiAttention::forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu) const {
+void PhiAttention::forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu,
+                           const PrefixExpansion& expansion) const {
     const std::size_t s = x.size(0);
     Tensor q, k, v;
     q_proj_.forward(x, q, use_gpu);
@@ -167,7 +168,32 @@ void PhiAttention::forward(const Tensor& x, Tensor& y, const std::vector<std::si
         k_proj_.forward(x, k, use_gpu);
         v_proj_.forward(x, v, use_gpu);
     }
-    Tensor out({s, apss26::NUM_ATTENTION_HEADS * apss26::HEAD_DIM});
+    const std::size_t attn_heads_dim =
+        apss26::NUM_ATTENTION_HEADS * apss26::HEAD_DIM;
+    if (use_gpu && expansion.active()) {
+        // q/k/v currently hold one row per distinct prefix. RoPE and attention
+        // both index by packed per-sequence position, so materialize the full
+        // token layout for them and fold the duplicate rows back afterwards.
+        // Rows of `out_full` that map to the same node are bit-identical, so
+        // contracting is a representative pick, not a reduction.
+        const std::size_t t = expansion.num_tokens;
+        Tensor qe({t, q.size(1)}), ke({t, k.size(1)}), ve({t, v.size(1)});
+        tensor_ops::gather_rows_gpu(q, *expansion.expand, qe);
+        tensor_ops::gather_rows_gpu(k, *expansion.expand, ke);
+        tensor_ops::gather_rows_gpu(v, *expansion.expand, ve);
+        Tensor out_full({t, attn_heads_dim});
+        tensor_ops::apply_rope_gpu(
+            qe, ke, seq_lens, apss26::NUM_ATTENTION_HEADS,
+            apss26::NUM_KV_HEADS, apss26::HEAD_DIM, apss26::ROPE_THETA);
+        tensor_ops::attention_gpu(
+            qe, ke, ve, out_full, seq_lens, apss26::NUM_ATTENTION_HEADS,
+            apss26::NUM_KV_HEADS, apss26::HEAD_DIM);
+        Tensor out({s, attn_heads_dim});
+        tensor_ops::gather_rows_gpu(out_full, *expansion.contract, out);
+        o_proj_.forward(out, y, true);
+        return;
+    }
+    Tensor out({s, attn_heads_dim});
     if (use_gpu) {
         tensor_ops::apply_rope_gpu(
             q, k, seq_lens, apss26::NUM_ATTENTION_HEADS,
@@ -245,7 +271,8 @@ PhiDecoderLayer::PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_id
       post_norm_bias_(loader.load("model.layers." + std::to_string(layer_idx) + ".post_attention_layernorm.bias")),
       attention_(loader, layer_idx), moe_(loader, layer_idx) {}
 
-void PhiDecoderLayer::forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu) const {
+void PhiDecoderLayer::forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu,
+                              const PrefixExpansion& expansion) const {
     Tensor normed(x.shape()), attn;
     if (use_gpu)
         tensor_ops::layer_norm_gpu(
@@ -253,7 +280,7 @@ void PhiDecoderLayer::forward(const Tensor& x, Tensor& y, const std::vector<std:
     else
         tensor_ops::layer_norm(
             x, input_norm_weight_, input_norm_bias_, apss26::NORM_EPS, normed);
-    attention_.forward(normed, attn, seq_lens, use_gpu);
+    attention_.forward(normed, attn, seq_lens, use_gpu, expansion);
     Tensor post(attn.shape()), ff;
     if (use_gpu) {
         tensor_ops::add_layer_norm_gpu(
