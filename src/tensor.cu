@@ -475,15 +475,19 @@ __global__ void k_layer_norm(
     const float* x, const float* weight, const float* bias, float* y,
     std::size_t h, float eps) {
     const std::size_t base = static_cast<std::size_t>(blockIdx.x) * h;
+    extern __shared__ float staged[];
     __shared__ float mean;
     __shared__ float inv;
+    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
+        staged[j] = x[base + j];
+    __syncthreads();
     if (threadIdx.x == 0) {
         float sum = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) sum += x[base + j];
+        for (std::size_t j = 0; j < h; ++j) sum += staged[j];
         mean = sum / static_cast<float>(h);
         float var = 0.0f;
         for (std::size_t j = 0; j < h; ++j) {
-            const float d = x[base + j] - mean;
+            const float d = staged[j] - mean;
             var += d * d;
         }
         inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
@@ -491,26 +495,30 @@ __global__ void k_layer_norm(
     __syncthreads();
     for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
         y[base + j] =
-            (x[base + j] - mean) * inv * weight[j] + bias[j];
+            (staged[j] - mean) * inv * weight[j] + bias[j];
 }
 
 __global__ void k_add_layer_norm(
     float* x, const float* residual, const float* weight, const float* bias,
     float* y, std::size_t h, float eps) {
     const std::size_t base = static_cast<std::size_t>(blockIdx.x) * h;
-    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
-        x[base + j] += residual[base + j];
+    extern __shared__ float staged[];
+    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x) {
+        const float value = x[base + j] + residual[base + j];
+        x[base + j] = value;
+        staged[j] = value;
+    }
     __syncthreads();
 
     __shared__ float mean;
     __shared__ float inv;
     if (threadIdx.x == 0) {
         float sum = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) sum += x[base + j];
+        for (std::size_t j = 0; j < h; ++j) sum += staged[j];
         mean = sum / static_cast<float>(h);
         float var = 0.0f;
         for (std::size_t j = 0; j < h; ++j) {
-            const float d = x[base + j] - mean;
+            const float d = staged[j] - mean;
             var += d * d;
         }
         inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
@@ -518,7 +526,7 @@ __global__ void k_add_layer_norm(
     __syncthreads();
     for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
         y[base + j] =
-            (x[base + j] - mean) * inv * weight[j] + bias[j];
+            (staged[j] - mean) * inv * weight[j] + bias[j];
 }
 
 __global__ void k_rope(
@@ -557,9 +565,13 @@ __global__ void k_attention(
     const std::size_t window = pos - begin + 1;
     extern __shared__ float shared[];
     float* scores = shared;
+    float* query = scores + max_seq;
     const std::size_t qbase = (row * q_heads + qh) * head_dim;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
+    if (threadIdx.x < head_dim)
+        query[threadIdx.x] = q[qbase + threadIdx.x];
+    __syncthreads();
     if (threadIdx.x == 0) {
         for (std::size_t w = 0; w < window; ++w) {
             const std::size_t key_row =
@@ -568,7 +580,7 @@ __global__ void k_attention(
                 (key_row * kv_heads + kh) * head_dim;
             float score = 0.0f;
             for (std::size_t d = 0; d < head_dim; ++d)
-                score += q[qbase + d] * k[kbase + d];
+                score += query[d] * k[kbase + d];
             scores[w] = score * scale;
         }
     }
@@ -781,7 +793,7 @@ void layer_norm_gpu(const Tensor& x, const Tensor& weight, const Tensor& bias,
     const std::size_t rows = x.size() / h;
     if (weight.size() != h || bias.size() != h || y.size() != x.size())
         throw std::invalid_argument("layer norm shape");
-    k_layer_norm<<<rows, 256>>>(
+    k_layer_norm<<<rows, 256, h * sizeof(float)>>>(
         x.cuda_data(), weight.cuda_data(), bias.cuda_data(),
         y.cuda_data_write(), h, eps);
     check_cuda(cudaGetLastError(), "k_layer_norm launch");
@@ -796,7 +808,7 @@ void add_layer_norm_gpu(Tensor& x, const Tensor& residual,
         bias.size() != h || y.size() != x.size())
         throw std::invalid_argument("add layer norm shape");
     x.cuda_data();
-    k_add_layer_norm<<<rows, 256>>>(
+    k_add_layer_norm<<<rows, 256, h * sizeof(float)>>>(
         x.cuda_data_write(), residual.cuda_data(), weight.cuda_data(),
         bias.cuda_data(), y.cuda_data_write(), h, eps);
     check_cuda(cudaGetLastError(), "k_add_layer_norm launch");

@@ -131,3 +131,11 @@ RTX 3090, warmup 없음, 기존 `main.cpp` 측정 구간과 검증을 그대로 
 크면 GPU routing을, GEMM 비중이 계속 가장 크면 projection fusion 또는 WMMA를,
 allocation 비중이 크면 reusable workspace를 먼저 진행한다.
 
+## 2026-08-25 업데이트
+
+- residual add와 post-attention LayerNorm을 하나의 CUDA kernel로 결합했다.
+- LayerNorm 입력을 shared memory에 coalesced staging하되 평균과 분산의 누적
+  순서는 그대로 유지했다.
+- attention query를 기존 shared-memory 예약 공간에 한 번만 적재해 재사용했다.
+- 최종 제출은 n=1024에서 6.330615초, 161.753638 seq/s, 검증 통과였다.
+- 상세 실험과 폐기한 병렬 reduction 결과는 `2026-08-25-optimization.md`에 있다.
