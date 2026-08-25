@@ -1383,6 +1383,95 @@ k_moe_matmul_grouped_async(
         }
 }
 
+__global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
+k_moe_matmul_grouped_wide_async(
+    const float* a, const float* const* weights, float* out,
+    const std::uint32_t* offsets, const std::uint32_t* work_expert,
+    const std::uint32_t* work_start, std::size_t max_work,
+    std::size_t k, std::size_t n) {
+    const std::size_t wi = blockIdx.y;
+    if (wi >= max_work) return;
+    const std::uint32_t expert = work_expert[wi];
+    if (expert >= apss26::NUM_EXPERTS) return;
+    const std::size_t start = work_start[wi];
+    const std::size_t end = offsets[expert + 1];
+    __shared__ __align__(16) float As[2][BIG_BM][BIG_BK];
+    __shared__ __align__(16) float Bs[2][WIDE_BN][BIG_BK];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * WIDE_BN;
+    const std::size_t row0 = start + ty * BIG_TM;
+    const std::size_t col0 = block_col + tx * WIDE_TN;
+    float acc[BIG_TM][WIDE_TN] = {};
+    const float* weight = weights[expert];
+    const std::size_t tiles = k / BIG_BK;
+
+    auto issue = [&](int stage, std::size_t p0) {
+        constexpr int vectors_per_tile = BIG_BM * BIG_BK / 4;
+        for (int vec = tid; vec < vectors_per_tile;
+             vec += BIG_BX * BIG_BY) {
+            const int lr = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const std::size_t row = start + lr;
+            const float* src = row < end
+                ? a + row * k + p0 + chunk * 4 : a;
+            cp_async_16(&As[stage][lr][chunk * 4], src,
+                        row < end ? 16 : 0);
+        }
+        constexpr int b_vectors = WIDE_BN * BIG_BK / 4;
+        for (int vec = tid; vec < b_vectors; vec += BIG_BX * BIG_BY) {
+            const int lc = vec / (BIG_BK / 4);
+            const int chunk = vec % (BIG_BK / 4);
+            const int swizzled = chunk ^ ((lc >> 1) & 7);
+            const std::size_t col = block_col + lc;
+            const float* src = col < n
+                ? weight + col * k + p0 + chunk * 4 : weight;
+            cp_async_16(&Bs[stage][lc][swizzled * 4], src,
+                        col < n ? 16 : 0);
+        }
+        cp_async_commit();
+    };
+
+    issue(0, 0);
+    for (std::size_t tile = 0; tile < tiles; ++tile) {
+        const int stage = tile & 1;
+        if (tile + 1 < tiles) {
+            issue(stage ^ 1, (tile + 1) * BIG_BK);
+            cp_async_wait_one();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p) {
+            float bv[WIDE_TN];
+#pragma unroll
+            for (int cc = 0; cc < WIDE_TN; ++cc) {
+                const int lc = tx * WIDE_TN + cc;
+                const int physical_p =
+                    ((p / 4) ^ ((lc >> 1) & 7)) * 4 + (p & 3);
+                bv[cc] = Bs[stage][lc][physical_p];
+            }
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[stage][ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < WIDE_TN; ++cc)
+                    acc[r][cc] += av * bv[cc];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < WIDE_TN; ++cc) {
+            const std::size_t row = row0 + r, col = col0 + cc;
+            if (row < end && col < n) out[row * n + col] = acc[r][cc];
+        }
+}
+
 __global__ void k_moe_combine(
     const float* expert_out, const std::uint8_t* routes,
     const std::uint32_t* route_positions, float* out,
@@ -1901,7 +1990,22 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
     const dim3 out_grid(
         static_cast<unsigned>((h + BIG_BN - 1) / BIG_BN),
         static_cast<unsigned>(max_work));
-    if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0) {
+    if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0 && h % WIDE_BN == 0) {
+        static const bool wide_carveout = [] {
+            prefer_shared_carveout(reinterpret_cast<const void*>(
+                k_moe_matmul_grouped_wide_async));
+            return true;
+        }();
+        (void)wide_carveout;
+        const dim3 wide_grid(
+            static_cast<unsigned>(h / WIDE_BN),
+            static_cast<unsigned>(max_work));
+        k_moe_matmul_grouped_wide_async<<<wide_grid, block>>>(
+            activated.cuda_data(), weights.w2,
+            expert_output.cuda_data_write(),
+            scratch.offsets, scratch.work_expert, scratch.work_start,
+            max_work, apss26::EXPERT_INTERMEDIATE_SIZE, h);
+    } else if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0) {
         static const bool carveout_set = [] {
             prefer_shared_carveout(reinterpret_cast<const void*>(
                 k_moe_matmul_grouped_async));
