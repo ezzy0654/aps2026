@@ -1,0 +1,19 @@
+# Build products
+/main
+/obj/
+*.o
+
+# Generated outputs and profiles
+/outputs.bin
+*.nsys-rep
+*.sqlite
+
+# Model and evaluation data
+/model.bin
+/inputs.bin
+/inpust.bin
+/answer.bin
+/decode_answers.bin
+
+# Local backup files
+*.orig
