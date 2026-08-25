@@ -33,9 +33,9 @@ void Linear::forward(const Tensor& x, Tensor& y) const {
 }
 
 void Linear::forward_device(const float* d_x, float* d_y, std::size_t rows) const {
-    tensor_ops::device::matmul_transposed(d_x, weight_, d_y, rows);
-    if (bias_.size())
-        tensor_ops::device::add_bias_inplace(d_y, bias_, rows * weight_.size(0));
+    // Bias rides along in the GEMM epilogue rather than in a second kernel.
+    tensor_ops::device::matmul_transposed(d_x, weight_, d_y, rows,
+                                          bias_.size() ? &bias_ : nullptr);
 }
 
 PhiMLP::PhiMLP(const ModelLoader& loader, const std::string& prefix)

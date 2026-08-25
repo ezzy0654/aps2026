@@ -285,7 +285,8 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
                                                  float* __restrict__ C,
                                                  int M, int K, int N,
                                                  const tensor_ops::device::GroupTile* __restrict__ tiles,
-                                                 long long weight_stride) {
+                                                 long long weight_stride,
+                                                 const float* __restrict__ bias) {
     static_assert(TM % 4 == 0 && TN % 4 == 0, "micro-tile must be float4-shaped");
     // Each thread's TM rows are split into TM/4 groups of 4 *contiguous*
     // rows, the groups spread BM/(TM/4) apart. The earlier layout gave a
@@ -313,6 +314,7 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
     // loop needs *not* to be.
     __shared__ float As[2][kBlockK][LDA];
     __shared__ float Bs[2][kBlockK][LDB];
+
     constexpr int AL = (BM * kBlockK) / (4 * NT);
     constexpr int BL = (BN * kBlockK) / (4 * NT);
 
@@ -343,6 +345,7 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
     if constexpr (VEC) {
         constexpr int kVecK = kBlockK / 4;
         float4 ra[AL], rb[BL];
+
 
 #define APS_ISSUE(k0)                                                                 \
         _Pragma("unroll")                                                             \
@@ -444,6 +447,21 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
         }
     }
 
+    // This thread's TN bias entries depend only on (g, jj), not on the row, so
+    // they are hoisted out of the row loop: read once instead of once per
+    // stored element. Doing it inline cost 149 ms of GEMM time -- 8 distinct
+    // values fetched 64 times each.
+    float bv[TN];
+    if (bias != nullptr) {
+#pragma unroll
+        for (int g = 0; g < VN; ++g)
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const int gc = col0 + b_col + g * (BN / VN) + jj;
+                bv[g * 4 + jj] = (gc < N) ? bias[gc] : 0.0f;
+            }
+    }
+
 #pragma unroll
     for (int f = 0; f < VM; ++f) {
 #pragma unroll
@@ -455,12 +473,69 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
 #pragma unroll
                 for (int jj = 0; jj < 4; ++jj) {
                     const int gc = col0 + b_col + g * (BN / VN) + jj;
+                    // Bias folded into the store. It was a separate kernel that
+                    // read C back and rewrote it -- 765 MB of traffic per layer
+                    // to add an 8 KB vector. `bias` is block-uniform-null, and
+                    // the no-bias path adds nothing at all (rather than adding
+                    // 0.0f, which would turn a -0.0f accumulator into +0.0f).
                     if (gc < N)
-                        C[static_cast<std::size_t>(gr) * N + gc] = acc[f * 4 + ii][g * 4 + jj];
+                        C[static_cast<std::size_t>(gr) * N + gc] =
+                            (bias != nullptr) ? acc[f * 4 + ii][g * 4 + jj] + bv[g * 4 + jj]
+                                              : acc[f * 4 + ii][g * 4 + jj];
                 }
             }
         }
     }
+}
+
+// Tall-skinny GEMM for a tiny N (the MoE gate is N = 16). Here the output is
+// 1 MB against a 255 MB A, so the job is simply to stream A once at full
+// bandwidth -- there is no reuse to tile for. The square-tiled kernel below is
+// the wrong shape for it and measured 147 GB/s, 16% of peak.
+//
+// One block owns blockDim.y rows and all N columns; a K-chunk of both operands
+// is staged in shared so A is read exactly once, coalesced. Each thread owns
+// one (row, column) and walks p = 0..K-1 in order across the chunks, so the
+// accumulation order is the reference's.
+__global__ void matmul_narrow_n_kernel(const float* __restrict__ A,
+                                       const float* __restrict__ B,
+                                       float* __restrict__ C,
+                                       int M, int K, int N,
+                                       const float* __restrict__ bias) {
+    constexpr int BK = 64;
+    constexpr int LD = BK + 1;   // +1: the p-strided read below would otherwise
+                                 // put every column on one bank.
+    extern __shared__ float sh[];
+    const int nrow = static_cast<int>(blockDim.y);
+    float* As = sh;
+    float* Bs = sh + nrow * LD;
+
+    const int e = static_cast<int>(threadIdx.x);
+    const int r = static_cast<int>(threadIdx.y);
+    const int row0 = static_cast<int>(blockIdx.x) * nrow;
+    const int tid = r * static_cast<int>(blockDim.x) + e;
+    const int nt = static_cast<int>(blockDim.x * blockDim.y);
+
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        for (int idx = tid; idx < nrow * BK; idx += nt) {
+            const int rr = idx / BK, cc = idx % BK;
+            const int gr = row0 + rr, gk = k0 + cc;
+            As[rr * LD + cc] = (gr < M && gk < K) ? A[static_cast<std::size_t>(gr) * K + gk] : 0.0f;
+        }
+        for (int idx = tid; idx < N * BK; idx += nt) {
+            const int nn = idx / BK, cc = idx % BK;
+            const int gk = k0 + cc;
+            Bs[nn * LD + cc] = (gk < K) ? B[static_cast<std::size_t>(nn) * K + gk] : 0.0f;
+        }
+        __syncthreads();
+        const int lim = (K - k0 < BK) ? (K - k0) : BK;
+        for (int p = 0; p < lim; ++p) acc += As[r * LD + p] * Bs[e * LD + p];
+        __syncthreads();
+    }
+    const int gr = row0 + r;
+    if (gr < M && e < N)
+        C[static_cast<std::size_t>(gr) * N + e] = (bias != nullptr) ? acc + bias[e] : acc;
 }
 
 // Narrow-N fallback (one output per thread, 32x32 tile). The blocked kernel
@@ -469,7 +544,8 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
 __global__ void matmul_transposed_kernel(const float* __restrict__ A,
                                          const float* __restrict__ B,
                                          float* __restrict__ C,
-                                         int M, int K, int N) {
+                                         int M, int K, int N,
+                                        const float* __restrict__ bias) {
     __shared__ float As[kMatmulTile][kMatmulTile];
     __shared__ float Bs[kMatmulTile][kMatmulTile];
 
@@ -579,6 +655,80 @@ __global__ void layer_norm_apply_kernel(const float* __restrict__ x,
     }
 }
 
+// One block per row, with the row staged in shared memory. A row is h*4 bytes
+// -- 16 KB at h = 4096 -- so it crosses the DRAM boundary exactly once: both
+// reduction passes and the map all read it back out of shared.
+//
+// v16 split stats from apply, which fixed the map's coalescing but left the
+// reduction as one thread per row walking 4 bytes at a time down a row whose
+// neighbours are 16 KB away. That is 15,583 threads (~6 warps per SM of the 48
+// available) each with about one outstanding miss, so roughly 63 KB is in
+// flight against the 936 GB/s * ~600 ns ~= 562 KB needed to saturate the bus --
+// measured 211 GB/s, 23% of peak. It is not a bandwidth problem, it is a
+// memory-level-parallelism problem, and the fix is more independent loads in
+// flight rather than a better access pattern.
+//
+// Staging also removes two of the four passes over x: stats read the row twice
+// (mean, then variance) and apply read it a third time.
+//
+// The sums stay sequential in thread 0, in the reference's j = 0..h-1 order.
+// Only where the bytes come from changes, so the result is bit-identical.
+__global__ void layer_norm_fused_kernel(const float* __restrict__ x,
+                                        const float* __restrict__ weight,
+                                        const float* __restrict__ bias,
+                                        float eps, float* __restrict__ y,
+                                        int h, std::size_t rows) {
+    extern __shared__ float s[];
+    __shared__ float s_mean, s_inv;
+
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+    if (row >= rows) return;
+    const std::size_t base = row * static_cast<std::size_t>(h);
+
+    // float4 staging: the caller guarantees h % 4 == 0, and a row start is
+    // row*h*4 bytes into a cudaMalloc'd buffer, so it is 16 B aligned.
+    {
+        const float4* __restrict__ xr4 = reinterpret_cast<const float4*>(x + base);
+        float4* s4 = reinterpret_cast<float4*>(s);
+        const int h4 = h >> 2;
+        for (int i = static_cast<int>(threadIdx.x); i < h4; i += static_cast<int>(blockDim.x))
+            s4[i] = xr4[i];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        // Both sums are read four-at-a-time so the shared-load latency overlaps
+        // the add chain instead of sitting in front of every element. The adds
+        // still happen in the reference's j = 0,1,2,... order -- only the loads
+        // are batched -- so this is bit-identical to the scalar loop.
+        const float4* __restrict__ s4 = reinterpret_cast<const float4*>(s);
+        const int h4 = h >> 2;
+        float mean = 0.0f;
+        for (int i = 0; i < h4; ++i) {
+            const float4 v = s4[i];
+            mean += v.x; mean += v.y; mean += v.z; mean += v.w;
+        }
+        mean /= static_cast<float>(h);
+        float var = 0.0f;
+        for (int i = 0; i < h4; ++i) {
+            const float4 v = s4[i];
+            float d;
+            d = v.x - mean; var += d * d;
+            d = v.y - mean; var += d * d;
+            d = v.z - mean; var += d * d;
+            d = v.w - mean; var += d * d;
+        }
+        s_mean = mean;
+        s_inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
+    }
+    __syncthreads();
+
+    const float mean = s_mean;
+    const float inv = s_inv;
+    for (int j = static_cast<int>(threadIdx.x); j < h; j += static_cast<int>(blockDim.x))
+        y[base + j] = (s[j] - mean) * inv * weight[j] + bias[j];
+}
+
 // Grow-on-demand storage for the per-row (mean, inv) pair. Two floats per
 // row -- 125 KB at this input's row count.
 struct StatsBuffer { float2* ptr = nullptr; std::size_t capacity = 0; };
@@ -587,6 +737,29 @@ StatsBuffer g_ln_stats;
 void launch_layer_norm(const float* x, const float* weight, const float* bias, float eps,
                        float* y, std::size_t rows, std::size_t h) {
     if (rows == 0 || h == 0) return;
+
+    // Fused path: one block per row, row staged in shared. Needs h*4 bytes of
+    // shared per block and a float4-aligned row stride; anything else (a huge
+    // hidden size, an odd h) falls through to the split kernels below, which
+    // produce identical results.
+    const std::size_t shared_bytes = h * sizeof(float);
+    if (h % 4 == 0 && shared_bytes <= 48u * 1024u &&
+        rows <= static_cast<std::size_t>(2147483647)) {
+        // Ask for the largest shared carveout so 16 KB blocks reach the
+        // 6-blocks-per-SM the 1536-thread limit allows.
+        static bool carveout_set = false;
+        if (!carveout_set) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(layer_norm_fused_kernel),
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            carveout_set = true;
+        }
+        layer_norm_fused_kernel<<<static_cast<unsigned>(rows), 256, shared_bytes>>>(
+            x, weight, bias, eps, y, static_cast<int>(h), rows);
+        cuda_check(cudaGetLastError(), "layer_norm_fused kernel");
+        return;
+    }
+
     if (g_ln_stats.capacity < rows) {
         if (g_ln_stats.ptr) cudaFree(g_ln_stats.ptr);
         cuda_check(cudaMalloc(&g_ln_stats.ptr, rows * sizeof(float2)), "layer_norm stats cudaMalloc");
@@ -803,7 +976,8 @@ __global__ void scatter_add_rows_kernel(float* __restrict__ dst, const float* __
 // MoE gate (N=16) the older 32-wide kernel wastes less. Both keep the same
 // K accumulation order and agree bitwise.
 void launch_matmul(const float* d_a, const float* d_b, float* d_c,
-                   std::size_t m, std::size_t k, std::size_t n, const char* what) {
+                   std::size_t m, std::size_t k, std::size_t n, const char* what,
+                   const float* d_bias = nullptr) {
     constexpr std::size_t kSMs = 82;                 // RTX 3090
     const auto blocks_for = [&](std::size_t bm, std::size_t bn) {
         return ((n + bn - 1) / bn) * ((m + bm - 1) / bm);
@@ -817,13 +991,26 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
                      (reinterpret_cast<std::uintptr_t>(d_a) % 16 == 0) &&
                      (reinterpret_cast<std::uintptr_t>(d_b) % 16 == 0);
     if (n < static_cast<std::size_t>(kMatmulTile)) {
-        // Narrow N (the MoE gate, N=16): even a 64-wide tile is mostly
-        // padding, so use the one-output-per-thread kernel.
+        // Narrow N (the MoE gate, N=16): tall-skinny, so stream A once rather
+        // than tile it. Falls back to the old kernel if the row group's shared
+        // tile would not fit; both produce identical results.
+        const int nn = static_cast<int>(n);
+        int nrow = 256 / nn; if (nrow > 32) nrow = 32; if (nrow < 1) nrow = 1;
+        const std::size_t shb =
+            static_cast<std::size_t>(nrow + nn) * 65 * sizeof(float);
+        if (shb <= 48u * 1024u) {
+            const dim3 block(static_cast<unsigned>(nn), static_cast<unsigned>(nrow));
+            const dim3 grid(static_cast<unsigned>((m + nrow - 1) / nrow));
+            matmul_narrow_n_kernel<<<grid, block, shb>>>(
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), nn, d_bias);
+            cuda_check(cudaGetLastError(), what);
+            return;
+        }
         const dim3 block(kMatmulTile, kMatmulTile);
         const dim3 grid(static_cast<unsigned>((n + kMatmulTile - 1) / kMatmulTile),
                         static_cast<unsigned>((m + kMatmulTile - 1) / kMatmulTile));
         matmul_transposed_kernel<<<grid, block>>>(
-            d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n));
+            d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), d_bias);
     } else if (blocks_for(128, 128) >= 2 * kSMs) {
         // Measured 2026-08-25: a rectangular 128x256 or 256x128 tile (512
         // threads) keeps registers at 119 and threads/SM at 512 while raising
@@ -837,9 +1024,9 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
         const dim3 grid(static_cast<unsigned>((n + 127) / 128),
                         static_cast<unsigned>((m + 127) / 128));
         if (vec) matmul_transposed_blocked_kernel<128, 128, 8, 8, true><<<grid, block>>>(
-                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0);
+                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
         else     matmul_transposed_blocked_kernel<128, 128, 8, 8, false><<<grid, block>>>(
-                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0);
+                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
     } else {
         // Too few blocks at 128x128 (the MoE experts land here): a smaller
         // tile spreads the work over more SMs, which outweighs re-reading.
@@ -848,10 +1035,10 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
                         static_cast<unsigned>((m + 63) / 64));
         if (vec)
             matmul_transposed_blocked_kernel<64, 64, 4, 4, true><<<grid, block>>>(
-                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0);
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias);
         else
             matmul_transposed_blocked_kernel<64, 64, 4, 4, false><<<grid, block>>>(
-                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0);
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias);
     }
     cuda_check(cudaGetLastError(), what);
 }
@@ -874,16 +1061,16 @@ void launch_matmul_grouped(const float* d_a, const float* d_b, float* d_c,
         const dim3 block(128 / 8, 128 / 8);
         const dim3 grid(static_cast<unsigned>((n + 127) / 128), static_cast<unsigned>(num_tiles));
         if (vec) matmul_transposed_blocked_kernel<128, 128, 8, 8, true><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride);
+                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
         else     matmul_transposed_blocked_kernel<128, 128, 8, 8, false><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride);
+                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
     } else {
         const dim3 block(64 / 4, 64 / 4);
         const dim3 grid(static_cast<unsigned>((n + 63) / 64), static_cast<unsigned>(num_tiles));
         if (vec) matmul_transposed_blocked_kernel<64, 64, 4, 4, true><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride);
+                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
         else     matmul_transposed_blocked_kernel<64, 64, 4, 4, false><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride);
+                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
     }
     cuda_check(cudaGetLastError(), what);
 }
@@ -1108,10 +1295,14 @@ RowMap upload_row_map(const int* position, const int* path,
 
 
 
-void matmul_transposed(const float* d_a, const Tensor& weight, float* d_c, std::size_t m) {
+void matmul_transposed(const float* d_a, const Tensor& weight, float* d_c, std::size_t m,
+                       const Tensor* bias) {
     if (!weight.device_data()) throw std::runtime_error("device::matmul_transposed: weight not resident on device");
+    const float* d_bias = (bias != nullptr && bias->size()) ? bias->device_data() : nullptr;
+    if (d_bias == nullptr && bias != nullptr && bias->size())
+        throw std::runtime_error("device::matmul_transposed: bias not resident on device");
     launch_matmul(d_a, weight.device_data(), d_c, m, weight.size(1), weight.size(0),
-                  "device::matmul_transposed kernel");
+                  "device::matmul_transposed kernel", d_bias);
 }
 
 // Kept as a separate entry point only because PhiMoE's gate calls it; the

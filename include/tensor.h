@@ -179,7 +179,11 @@ struct RowMap {
 RowMap upload_row_map(const int* position, const int* path,
                       std::size_t rows, std::size_t max_len);
 
-void matmul_transposed(const float* d_a, const Tensor& weight, float* d_c, std::size_t m);
+// `bias`, when given, is folded into the GEMM's store: it used to be a
+// separate read-modify-write pass over C, moving 765 MB per layer to add an
+// 8 KB vector.
+void matmul_transposed(const float* d_a, const Tensor& weight, float* d_c, std::size_t m,
+                       const Tensor* bias = nullptr);
 
 // One launch covering several independent [rows_e, K] x [N, K] matmuls that
 // share K and N -- the 16 MoE experts. Each expert's rows must be contiguous
