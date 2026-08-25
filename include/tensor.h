@@ -37,8 +37,12 @@ public:
     void fill(float value);
     void zero() { fill(0.0f); }
     void prepare_cuda() const;
+    void prepare_cuda_bf16_weight(bool with_low_residual) const;
     const float* cuda_data() const;
     float* cuda_data_write();
+    const void* cuda_bf16_weight_hi() const { return cuda_bf16_hi_; }
+    const void* cuda_bf16_weight_lo() const { return cuda_bf16_lo_; }
+    bool has_cuda_bf16_weight() const { return cuda_bf16_hi_ != nullptr; }
     void sync_cuda_to_host() const;
 
 private:
@@ -46,6 +50,8 @@ private:
     std::size_t numel_ = 0;
     mutable std::vector<float> data_;
     mutable float* cuda_data_ = nullptr;
+    mutable void* cuda_bf16_hi_ = nullptr;
+    mutable void* cuda_bf16_lo_ = nullptr;
     mutable bool host_valid_ = true;
     mutable bool cuda_valid_ = false;
     std::size_t offset(std::initializer_list<std::size_t> indices) const;

@@ -13,6 +13,13 @@ static inline float accurate_exp(float x) {
 Linear::Linear(const ModelLoader& loader, const std::string& weight, const std::string& bias)
     : weight_(loader.load(weight)) {
     if (!bias.empty() && loader.has(bias)) bias_ = loader.load(bias);
+#ifdef USE_TC
+    // Restrict approximation to the terminal region so no later decoder
+    // layer can amplify it through another attention/router chain.
+    const bool terminal_tc = weight == "lm_head.weight" ||
+        weight.find("model.layers.31.self_attn.") == 0;
+    if (terminal_tc) weight_.prepare_cuda_bf16_weight(true);
+#endif
 }
 
 void Linear::forward(const Tensor& x, Tensor& y, bool use_gpu) const {

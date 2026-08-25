@@ -7,6 +7,8 @@
 #include <limits>
 #include <stdexcept>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <mma.h>
 #include <string>
 #include <unordered_map>
 namespace {
@@ -44,9 +46,13 @@ Tensor& Tensor::operator=(const Tensor& other) {
 
 Tensor::Tensor(Tensor&& other) noexcept
     : shape_(std::move(other.shape_)), numel_(other.numel_),
-      data_(std::move(other.data_)), cuda_data_(other.cuda_data_), host_valid_(other.host_valid_),
+      data_(std::move(other.data_)), cuda_data_(other.cuda_data_),
+      cuda_bf16_hi_(other.cuda_bf16_hi_), cuda_bf16_lo_(other.cuda_bf16_lo_),
+      host_valid_(other.host_valid_),
       cuda_valid_(other.cuda_valid_) {
     other.cuda_data_ = nullptr;
+    other.cuda_bf16_hi_ = nullptr;
+    other.cuda_bf16_lo_ = nullptr;
     other.numel_ = 0;
     other.host_valid_ = true;
     other.cuda_valid_ = false;
@@ -59,9 +65,13 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
     numel_ = other.numel_;
     data_ = std::move(other.data_);
     cuda_data_ = other.cuda_data_;
+    cuda_bf16_hi_ = other.cuda_bf16_hi_;
+    cuda_bf16_lo_ = other.cuda_bf16_lo_;
     host_valid_ = other.host_valid_;
     cuda_valid_ = other.cuda_valid_;
     other.cuda_data_ = nullptr;
+    other.cuda_bf16_hi_ = nullptr;
+    other.cuda_bf16_lo_ = nullptr;
     other.numel_ = 0;
     other.host_valid_ = true;
     other.cuda_valid_ = false;
@@ -70,7 +80,11 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
 
 void Tensor::release_cuda() {
     if (cuda_data_) cudaFreeAsync(cuda_data_, 0);
+    if (cuda_bf16_hi_) cudaFreeAsync(cuda_bf16_hi_, 0);
+    if (cuda_bf16_lo_) cudaFreeAsync(cuda_bf16_lo_, 0);
     cuda_data_ = nullptr;
+    cuda_bf16_hi_ = nullptr;
+    cuda_bf16_lo_ = nullptr;
     cuda_valid_ = false;
 }
 
@@ -105,6 +119,61 @@ void Tensor::prepare_cuda() const {
                           "cudaMemcpy tensor H2D");
         cuda_valid_ = true;
     }
+}
+
+namespace {
+__global__ void k_pack_bf16_weight(
+    const float* src, __nv_bfloat16* hi, __nv_bfloat16* lo,
+    std::size_t n, std::size_t k, std::size_t k_tiles) {
+    const std::size_t packed_idx =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = ((n + 15) / 16) * k_tiles * 256;
+    if (packed_idx >= total) return;
+    const std::size_t tile_elem = packed_idx & 255;
+    const std::size_t tile = packed_idx >> 8;
+    const std::size_t kt = tile % k_tiles;
+    const std::size_t nt = tile / k_tiles;
+    const std::size_t local_n = tile_elem / 16;
+    const std::size_t local_k = tile_elem % 16;
+    const std::size_t row = nt * 16 + local_n;
+    const std::size_t col = kt * 16 + local_k;
+    const float value = row < n && col < k ? src[row * k + col] : 0.0f;
+    const __nv_bfloat16 upper = __float2bfloat16_rn(value);
+    hi[packed_idx] = upper;
+    if (lo)
+        lo[packed_idx] = __float2bfloat16_rn(
+            value - __bfloat162float(upper));
+}
+}
+
+void Tensor::prepare_cuda_bf16_weight(bool with_low_residual) const {
+    if (shape_.size() != 2)
+        throw std::invalid_argument("BF16 packing requires a matrix");
+    if (cuda_bf16_hi_ && (!with_low_residual || cuda_bf16_lo_)) return;
+    prepare_cuda();
+    const std::size_t n_tiles = (shape_[0] + 15) / 16;
+    const std::size_t k_tiles = (shape_[1] + 15) / 16;
+    const std::size_t elems = n_tiles * k_tiles * 256;
+    if (!cuda_bf16_hi_)
+        tensor_cuda_check(cudaMallocAsync(&cuda_bf16_hi_,
+                                           elems * sizeof(__nv_bfloat16), 0),
+                          "cudaMallocAsync BF16 weight");
+    if (with_low_residual && !cuda_bf16_lo_)
+        tensor_cuda_check(cudaMallocAsync(&cuda_bf16_lo_,
+                                           elems * sizeof(__nv_bfloat16), 0),
+                          "cudaMallocAsync BF16 residual");
+    k_pack_bf16_weight<<<(elems + 255) / 256, 256>>>(
+        cuda_data_, static_cast<__nv_bfloat16*>(cuda_bf16_hi_),
+        static_cast<__nv_bfloat16*>(cuda_bf16_lo_),
+        shape_[0], shape_[1], k_tiles);
+    tensor_cuda_check(cudaGetLastError(), "k_pack_bf16_weight launch");
+    // Packing is ordered on the same stream, so the immutable FP32 device
+    // copy can be released without synchronizing. Host FP32 remains intact
+    // for the CPU/decode path.
+    tensor_cuda_check(cudaFreeAsync(cuda_data_, 0),
+                      "cudaFreeAsync packed FP32 weight");
+    cuda_data_ = nullptr;
+    cuda_valid_ = false;
 }
 
 const float* Tensor::cuda_data() const {
@@ -397,6 +466,76 @@ constexpr int BIG_BX = 32;
 constexpr int BIG_BY = 8;
 constexpr int BIG_TM = BIG_BM / BIG_BY;
 constexpr int BIG_TN = BIG_BN / BIG_BX;
+
+#ifdef USE_TC
+__global__ void k_matmul_transposed_bf16_wmma(
+    const float* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b_hi,
+    const __nv_bfloat16* __restrict__ b_lo,
+    float* __restrict__ c,
+    std::size_t m, std::size_t k, std::size_t n) {
+    using namespace nvcuda;
+    __shared__ __align__(16) __nv_bfloat16 a_hi[64 * 16];
+    __shared__ __align__(16) __nv_bfloat16 a_lo[64 * 16];
+    __shared__ __align__(16) float c_tile[64 * 64];
+    const int warp = threadIdx.x / 32;
+    const int warp_m = warp / 2;
+    const int warp_n0 = (warp % 2) * 2;
+    const std::size_t row0 = static_cast<std::size_t>(blockIdx.y) * 64;
+    const std::size_t col0 = static_cast<std::size_t>(blockIdx.x) * 64;
+    const std::size_t k_tiles = (k + 15) / 16;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
+    wmma::fill_fragment(acc[0], 0.0f);
+    wmma::fill_fragment(acc[1], 0.0f);
+    for (std::size_t kt = 0; kt < k_tiles; ++kt) {
+        for (int idx = threadIdx.x; idx < 64 * 16; idx += blockDim.x) {
+            const std::size_t lr = static_cast<std::size_t>(idx) / 16;
+            const std::size_t lk = static_cast<std::size_t>(idx) % 16;
+            const std::size_t row = row0 + lr;
+            const std::size_t p = kt * 16 + lk;
+            const float value = row < m && p < k ? a[row * k + p] : 0.0f;
+            const __nv_bfloat16 upper = __float2bfloat16_rn(value);
+            a_hi[idx] = upper;
+            a_lo[idx] = __float2bfloat16_rn(
+                value - __bfloat162float(upper));
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __nv_bfloat16, wmma::row_major> af_hi;
+        wmma::load_matrix_sync(af_hi, a_hi + warp_m * 256, 16);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __nv_bfloat16, wmma::row_major> af_lo;
+        wmma::load_matrix_sync(af_lo, a_lo + warp_m * 256, 16);
+        for (int nn = 0; nn < 2; ++nn) {
+            const std::size_t n_tile =
+                static_cast<std::size_t>(blockIdx.x) * 4 + warp_n0 + nn;
+            const std::size_t packed_tile = (n_tile * k_tiles + kt) * 256;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                           __nv_bfloat16, wmma::col_major> bf_hi;
+            wmma::load_matrix_sync(bf_hi, b_hi + packed_tile, 16);
+            wmma::mma_sync(acc[nn], af_hi, bf_hi, acc[nn]);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                           __nv_bfloat16, wmma::col_major> bf_lo;
+            wmma::load_matrix_sync(bf_lo, b_lo + packed_tile, 16);
+            wmma::mma_sync(acc[nn], af_hi, bf_lo, acc[nn]);
+            wmma::mma_sync(acc[nn], af_lo, bf_hi, acc[nn]);
+        }
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(
+        c_tile + warp_m * 16 * 64 + warp_n0 * 16,
+        acc[0], 64, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        c_tile + warp_m * 16 * 64 + (warp_n0 + 1) * 16,
+        acc[1], 64, wmma::mem_row_major);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 64 * 64; idx += blockDim.x) {
+        const std::size_t row = row0 + static_cast<std::size_t>(idx) / 64;
+        const std::size_t col = col0 + static_cast<std::size_t>(idx) % 64;
+        if (row < m && col < n) c[row * n + col] = c_tile[idx];
+    }
+}
+#endif
 
 __global__ void k_matmul_transposed_register_blocked(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -840,8 +979,22 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
     if (b.size(1) != k || c.size(0) != m || c.size(1) != n)
         throw std::invalid_argument("matmul_transposed_gpu shape");
     const float* da = a.cuda_data();
-    const float* db = b.cuda_data();
     float* dc = c.cuda_data_write();
+#ifdef USE_TC
+    if (b.has_cuda_bf16_weight() && n % 64 == 0 && k % 16 == 0) {
+        const dim3 grid(static_cast<unsigned>((n + 63) / 64),
+                        static_cast<unsigned>((m + 63) / 64));
+        k_matmul_transposed_bf16_wmma<<<grid, 256>>>(
+            da,
+            static_cast<const __nv_bfloat16*>(b.cuda_bf16_weight_hi()),
+            static_cast<const __nv_bfloat16*>(b.cuda_bf16_weight_lo()),
+            dc, m, k, n);
+        check_cuda(cudaGetLastError(),
+                   "k_matmul_transposed_bf16_wmma launch");
+        return;
+    }
+#endif
+    const float* db = b.cuda_data();
     if (m >= BIG_BM && n >= BIG_BN) {
         const dim3 block(BIG_BX, BIG_BY);
         const dim3 grid(

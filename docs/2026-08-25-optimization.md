@@ -171,3 +171,57 @@ n=1024 finalist 결과:
 - validation mean abs diff: 1.3264e-05
 - 직전 개인 최고 대비: +0.9%
 - 제출 시점 순위: 2위 / 8명
+
+## BF16 Tensor Core 및 weight pre-packing 실험
+
+RTX 3090(sm_86)의 native BF16 Tensor Core를 외부 라이브러리 없이 사용하는
+`USE_TC=1` opt-in 경로를 추가했다. 기본 FP32 빌드와 연산 경로는 그대로 유지한다.
+
+### 구현 구조
+
+- FP32 weight를 모델 초기화 중 16x16 tile-major BF16으로 pre-pack한다.
+- 정확도 보정을 위해 `hi = BF16(x)`, `lo = BF16(x - FP32(hi))` 두 배열을 둔다.
+- 두 BF16 배열의 합계는 FP32와 같은 4 bytes/weight이며, packing 완료 후 선택된
+  weight의 기존 FP32 GPU 복사본은 비동기로 해제한다. 따라서 순수 BF16의 2배
+  대역폭 이득 대신 정확도와 Tensor Core 처리량을 택한 경로다.
+- custom WMMA kernel이 `Ahi*Bhi + Ahi*Blo + Alo*Bhi` 세 항을 FP32
+  accumulator에 누적한다.
+- CUDA block은 256 threads(8 warps), output 64x64, K tile 16이다.
+- 한 warp가 16x16 accumulator 두 개를 담당하며 64x16 activation tile을
+  16개 output tile이 공유한다.
+- 수치 오차가 이후 routing으로 증폭되지 않도록 최종 LM head와 layer 31의
+  Q/K/V/O projection에만 적용한다.
+
+### 정확도 경계 ablation
+
+| 구성 | n | 시간(초) | 최대 절대 오차 | 검증 |
+|---|---:|---:|---:|---|
+| 전체 projection/W2 순수 BF16 | 64 | 1.029111 | 1.32071 | FAILED |
+| 전체 projection/W2 split-BF16 3항 | 64 | 1.085304 | 0.0235329 | FAILED |
+| router FP32 + split-BF16 4항 | 64 | 1.065877 | 0.299095 | FAILED |
+| LM head만 split-BF16 | 64 | 0.683977 | 0.00119019 | PASSED |
+| LM head만 split-BF16 | 1024 | 6.030575 | 0.00396729 | PASSED |
+| LM head + layer 31 attention | 1024 | 6.013399 | 0.00369644 | PASSED |
+| 위 구성, 3항 보정 1차 | 1024 | 6.004792 | 0.00369644 | PASSED |
+| 위 구성, 3항 보정 반복 | 1024 | 6.035852 | 0.00369644 | PASSED |
+| 최종 재빌드 검증 | 1024 | 6.039755 | 0.00369644 | PASSED |
+| 공식 제출 | 1024 | 6.037589 | 0.00369644 | PASSED |
+| FP32 GPU copy 해제 후 검증 | 1024 | 6.009348 | 0.00369644 | PASSED |
+| 최종 공식 제출 | 1024 | 6.029168 | 0.00369644 | PASSED |
+
+마지막 2개 layer attention까지 확대하면 n=64 최대 오차가 0.0221062로
+실패했고, 마지막 4개 layer는 한 token의 expert route가 바뀌어 최대 오차가
+0.175797까지 커졌다. 192-column WMMA block도 activation 재사용은 늘었지만
+warp당 accumulator 6개의 register pressure로 n=1024가 6.080052초로 느려져
+64-column block으로 복구했다.
+
+최종 공식 제출 처리량은 169.841024 seq/s로 기존 개인 최고 168.083798 seq/s보다
+약 1.0% 높았으며, 제출 시점 순위는 5위 / 10명이었다.
+
+재현 명령:
+
+```bash
+make clean
+make -j4 USE_TC=1
+./run.sh -n 1024 -v
+```
