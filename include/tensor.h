@@ -93,6 +93,12 @@ void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,
 void scatter_add_rows_gpu(const Tensor& x,
                           const std::vector<std::size_t>& rows,
                           float scale, Tensor& out);
+std::size_t register_moe_weights_gpu(
+    const std::vector<const Tensor*>& w1,
+    const std::vector<const Tensor*>& w2,
+    const std::vector<const Tensor*>& w3);
+void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
+                             std::size_t weights_handle, Tensor& out);
 void add_inplace(Tensor& a, const Tensor& b);
 void add_bias_inplace(Tensor& a, const Tensor& bias);
 void mul(const Tensor& a, const Tensor& b, Tensor& c);

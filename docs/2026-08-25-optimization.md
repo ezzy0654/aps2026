@@ -297,3 +297,52 @@ split-BF16 빌드의 반복 중앙값은 5.940850초로 직전 공식 결과 6.0
 약 88ms, 1.46% 개선됐다. Nsight Systems에서 grouped attention 32회 합계는
 0.399138초였고, 기존 K-staging kernel의 약 0.484초보다 약 85ms 감소해 전체
 개선량과 일치했다. 사용자 요청에 따라 이 결과는 대회에 제출하지 않았다.
+
+## Host-free deterministic MoE routing 및 grouped expert GEMM
+
+기존 GPU MoE는 router GEMM 이후 logits 전체를 D2H 복사하고 CPU에서 top-2와
+expert별 row list를 만든 다음 각 expert row index를 다시 H2D 복사했다. 이를
+다음 device-only pipeline으로 교체했다.
+
+```text
+GPU router logits
+→ GPU quantized deterministic top-2 + integer expert count
+→ GPU expert offsets 및 64-row work queue
+→ GPU stable token-order compaction
+→ compact expert input gather
+→ grouped W1/W3 + SiLU
+→ grouped W2
+→ token별 deterministic expert-order combine
+```
+
+- 모델 초기화 때 expert W1/W2/W3 device pointer table만 등록한다.
+- 측정 구간에서는 router logits D2H와 row-index H2D가 없다.
+- top-2는 기존 `ROUTER_SCORE_QUANTUM`, `ROUTER_TIE_EPS`, 낮은 expert index
+  우선 규칙을 그대로 구현한다.
+- Integer atomic은 expert count에만 사용한다. 출력 합산에는 atomic을 쓰지 않는다.
+- Expert별 token은 ballot/prefix compaction으로 원래 token 순서를 유지한다.
+- Combine은 두 expert 결과를 expert 번호 오름차순으로 더해 기존 16개 expert
+  순차 scatter-add의 FP32 순서를 재현한다.
+- 각 work item은 최대 64 rows이며 grouped GEMM이 device의 expert pointer와
+  offset을 직접 읽으므로 host가 동적 expert count를 알 필요가 없다.
+
+### 성능 및 정확도
+
+| 구성 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| 1-thread stable plan 1차 | 64 | 0.407979 | 156.870912 | PASSED |
+| 1-thread stable plan 1차 | 1024 | 5.699157 | 179.675705 | PASSED |
+| 반복 1 | 1024 | 5.680974 | 180.250789 | PASSED |
+| 반복 2 | 1024 | 5.704151 | 179.518385 | PASSED |
+| ballot/prefix stable plan | 64 | 0.404579 | 158.189281 | PASSED |
+| ballot/prefix 1차 | 1024 | 5.644809 | 181.405609 | PASSED |
+| ballot/prefix 반복 1 | 1024 | 5.632597 | 181.798919 | PASSED |
+| ballot/prefix 반복 2 | 1024 | 5.674278 | 180.463493 | PASSED |
+| 기본 FP32 빌드 | 64 | 0.405022 | 158.016000 | PASSED |
+| 기본 FP32 빌드 | 1024 | 5.667703 | 180.672833 | PASSED |
+
+split-BF16 빌드의 최종 중앙값은 5.644809초다. grouped-GQA만 적용한
+5.940850초보다 약 296ms(4.98%), 이전 공식 결과 6.029168초보다 약
+384ms(6.38%) 줄었다. 초기 device plan은 Nsight에서 32회 합계 0.075037초였고,
+integer count와 256-thread ballot/prefix stable compaction으로 바꾼 뒤 전체
+시간이 추가로 약 54ms 감소했다. 사용자 요청에 따라 제출하지 않았다.

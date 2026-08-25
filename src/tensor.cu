@@ -684,6 +684,352 @@ __global__ void k_matmul_pair_silu_register_blocked(
         }
 }
 
+struct MoeWeightSet {
+    const float** w1 = nullptr;
+    const float** w2 = nullptr;
+    const float** w3 = nullptr;
+};
+
+std::vector<MoeWeightSet>& moe_weight_registry() {
+    static std::vector<MoeWeightSet> registry;
+    return registry;
+}
+
+struct MoeScratch {
+    std::uint8_t* routes = nullptr;
+    std::uint32_t* counts = nullptr;
+    std::uint32_t* offsets = nullptr;
+    std::uint32_t* assignment_rows = nullptr;
+    std::uint32_t* route_positions = nullptr;
+    std::uint32_t* work_expert = nullptr;
+    std::uint32_t* work_start = nullptr;
+    std::size_t row_capacity = 0;
+    std::size_t work_capacity = 0;
+};
+
+MoeScratch& moe_scratch(std::size_t rows) {
+    static MoeScratch scratch;
+    const std::size_t max_work = (2 * rows + BIG_BM - 1) / BIG_BM +
+                                 apss26::NUM_EXPERTS;
+    if (scratch.row_capacity >= rows && scratch.work_capacity >= max_work)
+        return scratch;
+    if (scratch.routes) cudaFree(scratch.routes);
+    if (scratch.counts) cudaFree(scratch.counts);
+    if (scratch.offsets) cudaFree(scratch.offsets);
+    if (scratch.assignment_rows) cudaFree(scratch.assignment_rows);
+    if (scratch.route_positions) cudaFree(scratch.route_positions);
+    if (scratch.work_expert) cudaFree(scratch.work_expert);
+    if (scratch.work_start) cudaFree(scratch.work_start);
+    check_cuda(cudaMalloc(&scratch.routes, 2 * rows * sizeof(std::uint8_t)),
+               "cudaMalloc MoE routes");
+    check_cuda(cudaMalloc(&scratch.counts,
+                          apss26::NUM_EXPERTS * sizeof(std::uint32_t)),
+               "cudaMalloc MoE counts");
+    check_cuda(cudaMalloc(&scratch.offsets,
+                          (apss26::NUM_EXPERTS + 1) *
+                              sizeof(std::uint32_t)),
+               "cudaMalloc MoE offsets");
+    check_cuda(cudaMalloc(&scratch.assignment_rows,
+                          2 * rows * sizeof(std::uint32_t)),
+               "cudaMalloc MoE assignment rows");
+    check_cuda(cudaMalloc(&scratch.route_positions,
+                          2 * rows * sizeof(std::uint32_t)),
+               "cudaMalloc MoE route positions");
+    check_cuda(cudaMalloc(&scratch.work_expert,
+                          max_work * sizeof(std::uint32_t)),
+               "cudaMalloc MoE work experts");
+    check_cuda(cudaMalloc(&scratch.work_start,
+                          max_work * sizeof(std::uint32_t)),
+               "cudaMalloc MoE work starts");
+    scratch.row_capacity = rows;
+    scratch.work_capacity = max_work;
+    return scratch;
+}
+
+__global__ void k_moe_top2(const float* router, std::uint8_t* routes,
+                           std::uint32_t* counts, std::size_t rows) {
+    const std::size_t t =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= rows) return;
+    float scores[apss26::NUM_EXPERTS];
+#pragma unroll
+    for (std::size_t e = 0; e < apss26::NUM_EXPERTS; ++e) {
+        const float score = router[t * apss26::NUM_EXPERTS + e];
+        const float rounded = floorf(fabsf(score) /
+            apss26::ROUTER_SCORE_QUANTUM + 0.5f) *
+            apss26::ROUTER_SCORE_QUANTUM;
+        scores[e] = score < 0.0f ? -rounded : rounded;
+    }
+    int first = -1;
+    float first_value = -3.402823466e+38F;
+#pragma unroll
+    for (int e = 0; e < static_cast<int>(apss26::NUM_EXPERTS); ++e) {
+        if (first < 0 || scores[e] > first_value + apss26::ROUTER_TIE_EPS) {
+            first = e;
+            first_value = scores[e];
+        }
+    }
+    int second = -1;
+    float second_value = -3.402823466e+38F;
+#pragma unroll
+    for (int e = 0; e < static_cast<int>(apss26::NUM_EXPERTS); ++e) {
+        if (e == first) continue;
+        if (second < 0 ||
+            scores[e] > second_value + apss26::ROUTER_TIE_EPS) {
+            second = e;
+            second_value = scores[e];
+        }
+    }
+    routes[2 * t] = static_cast<std::uint8_t>(first);
+    routes[2 * t + 1] = static_cast<std::uint8_t>(second);
+    atomicAdd(counts + first, 1u);
+    atomicAdd(counts + second, 1u);
+}
+
+__global__ void k_moe_offsets_work(
+    const std::uint32_t* counts, std::uint32_t* offsets,
+    std::uint32_t* work_expert, std::uint32_t* work_start) {
+    __shared__ std::uint32_t work_offsets[apss26::NUM_EXPERTS + 1];
+    if (threadIdx.x == 0) {
+        offsets[0] = 0;
+        work_offsets[0] = 0;
+        for (std::size_t expert = 0; expert < apss26::NUM_EXPERTS;
+             ++expert) {
+            offsets[expert + 1] = offsets[expert] + counts[expert];
+            work_offsets[expert + 1] = work_offsets[expert] +
+                (counts[expert] + BIG_BM - 1) / BIG_BM;
+        }
+    }
+    __syncthreads();
+    const unsigned e = threadIdx.x;
+    if (e < apss26::NUM_EXPERTS) {
+        const std::uint32_t chunks =
+            (counts[e] + BIG_BM - 1) / BIG_BM;
+        for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+            const std::uint32_t wi = work_offsets[e] + chunk;
+            work_expert[wi] = e;
+            work_start[wi] = offsets[e] + chunk * BIG_BM;
+        }
+    }
+}
+
+__global__ void k_moe_fill_stable(
+    const std::uint8_t* routes, const std::uint32_t* offsets,
+    std::uint32_t* assignment_rows, std::uint32_t* route_positions,
+    std::size_t rows) {
+    const unsigned expert = blockIdx.x;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31;
+    const unsigned warp = tid >> 5;
+    __shared__ std::uint32_t base;
+    __shared__ std::uint32_t warp_counts[8];
+    __shared__ std::uint32_t warp_offsets[9];
+    if (tid == 0) base = offsets[expert];
+    __syncthreads();
+    for (std::size_t tile = 0; tile < rows; tile += blockDim.x) {
+        const std::size_t t = tile + tid;
+        int slot = -1;
+        if (t < rows) {
+            if (routes[2 * t] == expert) slot = 0;
+            else if (routes[2 * t + 1] == expert) slot = 1;
+        }
+        const unsigned mask = __ballot_sync(0xffffffffu, slot >= 0);
+        if (lane == 0) warp_counts[warp] = __popc(mask);
+        __syncthreads();
+        if (tid == 0) {
+            warp_offsets[0] = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                warp_offsets[w + 1] = warp_offsets[w] + warp_counts[w];
+        }
+        __syncthreads();
+        if (slot >= 0) {
+            const unsigned lower =
+                lane == 0 ? 0u : ((1u << lane) - 1u);
+            const std::uint32_t position = base + warp_offsets[warp] +
+                                           __popc(mask & lower);
+            assignment_rows[position] = static_cast<std::uint32_t>(t);
+            route_positions[2 * t + static_cast<unsigned>(slot)] = position;
+        }
+        __syncthreads();
+        if (tid == 0) base += warp_offsets[8];
+        __syncthreads();
+    }
+}
+
+__global__ void k_moe_gather_compact(
+    const float* x, const std::uint32_t* assignment_rows, float* out,
+    std::size_t assignments, std::size_t h) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < assignments * h)
+        out[i] = x[static_cast<std::size_t>(assignment_rows[i / h]) * h +
+                   i % h];
+}
+
+__global__ void k_moe_pair_silu_grouped(
+    const float* a, const float* const* gate_weights,
+    const float* const* up_weights, float* out,
+    const std::uint32_t* offsets, const std::uint32_t* work_expert,
+    const std::uint32_t* work_start, std::size_t max_work,
+    std::size_t k, std::size_t n) {
+    const std::size_t wi = blockIdx.y;
+    if (wi >= max_work) return;
+    const std::uint32_t expert = work_expert[wi];
+    if (expert >= apss26::NUM_EXPERTS) return;
+    const std::size_t start = work_start[wi];
+    const std::size_t end = offsets[expert + 1];
+    __shared__ float As[BIG_BM][BIG_BK + 1];
+    __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t row0 = start + ty * BIG_TM;
+    const std::size_t col0 =
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * BIG_TN;
+    float gate_acc[BIG_TM][BIG_TN] = {};
+    float up_acc[BIG_TM][BIG_TN] = {};
+    const float* gate_weight = gate_weights[expert];
+    const float* up_weight = up_weights[expert];
+    for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lr = idx / BIG_BK, lp = idx % BIG_BK;
+            const std::size_t row = start + lr, p = p0 + lp;
+            As[lr][lp] = row < end && p < k ? a[row * k + p] : 0.0f;
+        }
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK, lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? gate_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    gate_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        __syncthreads();
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK, lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? up_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    up_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < BIG_TN; ++cc) {
+            const std::size_t row = row0 + r, col = col0 + cc;
+            if (row < end && col < n) {
+                const float x = gate_acc[r][cc];
+                out[row * n + col] =
+                    x / (1.0f + static_cast<float>(
+                        exp(static_cast<double>(-x)))) * up_acc[r][cc];
+            }
+        }
+}
+
+__global__ void k_moe_matmul_grouped(
+    const float* a, const float* const* weights, float* out,
+    const std::uint32_t* offsets, const std::uint32_t* work_expert,
+    const std::uint32_t* work_start, std::size_t max_work,
+    std::size_t k, std::size_t n) {
+    const std::size_t wi = blockIdx.y;
+    if (wi >= max_work) return;
+    const std::uint32_t expert = work_expert[wi];
+    if (expert >= apss26::NUM_EXPERTS) return;
+    const std::size_t start = work_start[wi];
+    const std::size_t end = offsets[expert + 1];
+    __shared__ float As[BIG_BM][BIG_BK + 1];
+    __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t row0 = start + ty * BIG_TM;
+    const std::size_t col0 =
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * BIG_TN;
+    float acc[BIG_TM][BIG_TN] = {};
+    const float* weight = weights[expert];
+    for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lr = idx / BIG_BK, lp = idx % BIG_BK;
+            const std::size_t row = start + lr, p = p0 + lp;
+            As[lr][lp] = row < end && p < k ? a[row * k + p] : 0.0f;
+        }
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK, lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k ? weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p)
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < BIG_TN; ++cc) {
+            const std::size_t row = row0 + r, col = col0 + cc;
+            if (row < end && col < n) out[row * n + col] = acc[r][cc];
+        }
+}
+
+__global__ void k_moe_combine(
+    const float* expert_out, const std::uint8_t* routes,
+    const std::uint32_t* route_positions, float* out,
+    std::size_t rows, std::size_t h) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows * h) return;
+    const std::size_t t = i / h, d = i % h;
+    const std::uint8_t e0 = routes[2 * t], e1 = routes[2 * t + 1];
+    const std::uint32_t p0 = route_positions[2 * t];
+    const std::uint32_t p1 = route_positions[2 * t + 1];
+    float value = 0.0f;
+    if (e0 < e1) {
+        value += 0.5f * expert_out[static_cast<std::size_t>(p0) * h + d];
+        value += 0.5f * expert_out[static_cast<std::size_t>(p1) * h + d];
+    } else {
+        value += 0.5f * expert_out[static_cast<std::size_t>(p1) * h + d];
+        value += 0.5f * expert_out[static_cast<std::size_t>(p0) * h + d];
+    }
+    out[i] = value;
+}
+
 __global__ void k_add(float* a, const float* b, std::size_t n) {
     const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] += b[i];
@@ -1064,6 +1410,104 @@ std::uint32_t* device_rows(const std::vector<std::size_t>& rows) {
     return ptr;
 }
 
+}
+
+std::size_t register_moe_weights_gpu(
+    const std::vector<const Tensor*>& w1,
+    const std::vector<const Tensor*>& w2,
+    const std::vector<const Tensor*>& w3) {
+    if (w1.size() != apss26::NUM_EXPERTS ||
+        w2.size() != apss26::NUM_EXPERTS ||
+        w3.size() != apss26::NUM_EXPERTS)
+        throw std::invalid_argument("MoE weight table size");
+    std::vector<const float*> h_w1(apss26::NUM_EXPERTS);
+    std::vector<const float*> h_w2(apss26::NUM_EXPERTS);
+    std::vector<const float*> h_w3(apss26::NUM_EXPERTS);
+    for (std::size_t e = 0; e < apss26::NUM_EXPERTS; ++e) {
+        h_w1[e] = w1[e]->cuda_data();
+        h_w2[e] = w2[e]->cuda_data();
+        h_w3[e] = w3[e]->cuda_data();
+    }
+    MoeWeightSet set;
+    const std::size_t bytes =
+        apss26::NUM_EXPERTS * sizeof(const float*);
+    check_cuda(cudaMalloc(&set.w1, bytes), "cudaMalloc MoE W1 table");
+    check_cuda(cudaMalloc(&set.w2, bytes), "cudaMalloc MoE W2 table");
+    check_cuda(cudaMalloc(&set.w3, bytes), "cudaMalloc MoE W3 table");
+    check_cuda(cudaMemcpy(set.w1, h_w1.data(), bytes,
+                          cudaMemcpyHostToDevice), "copy MoE W1 table");
+    check_cuda(cudaMemcpy(set.w2, h_w2.data(), bytes,
+                          cudaMemcpyHostToDevice), "copy MoE W2 table");
+    check_cuda(cudaMemcpy(set.w3, h_w3.data(), bytes,
+                          cudaMemcpyHostToDevice), "copy MoE W3 table");
+    auto& registry = moe_weight_registry();
+    registry.push_back(set);
+    return registry.size();
+}
+
+void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
+                             std::size_t weights_handle, Tensor& out) {
+    const std::size_t rows = x.size(0), h = x.size(1);
+    if (router.size(0) != rows ||
+        router.size(1) != apss26::NUM_EXPERTS ||
+        weights_handle == 0 ||
+        weights_handle > moe_weight_registry().size())
+        throw std::invalid_argument("grouped MoE shape or handle");
+    MoeScratch& scratch = moe_scratch(rows);
+    const std::size_t assignments = 2 * rows;
+    const std::size_t max_work =
+        (assignments + BIG_BM - 1) / BIG_BM + apss26::NUM_EXPERTS;
+    check_cuda(cudaMemsetAsync(scratch.work_expert, 0xff,
+                               max_work * sizeof(std::uint32_t), 0),
+               "clear MoE work queue");
+    check_cuda(cudaMemsetAsync(scratch.counts, 0,
+                               apss26::NUM_EXPERTS * sizeof(std::uint32_t), 0),
+               "clear MoE counts");
+    k_moe_top2<<<(rows + 255) / 256, 256>>>(
+        router.cuda_data(), scratch.routes, scratch.counts, rows);
+    k_moe_offsets_work<<<1, 32>>>(
+        scratch.counts, scratch.offsets,
+        scratch.work_expert, scratch.work_start);
+    k_moe_fill_stable<<<apss26::NUM_EXPERTS, 256>>>(
+        scratch.routes, scratch.offsets, scratch.assignment_rows,
+        scratch.route_positions, rows);
+    check_cuda(cudaGetLastError(), "MoE routing kernels launch");
+
+    Tensor compact_input({assignments, h});
+    const std::size_t input_elems = assignments * h;
+    k_moe_gather_compact<<<(input_elems + 255) / 256, 256>>>(
+        x.cuda_data(), scratch.assignment_rows,
+        compact_input.cuda_data_write(), assignments, h);
+
+    Tensor activated({assignments, apss26::EXPERT_INTERMEDIATE_SIZE});
+    const MoeWeightSet& weights =
+        moe_weight_registry()[weights_handle - 1];
+    const dim3 block(BIG_BX, BIG_BY);
+    const dim3 pair_grid(
+        static_cast<unsigned>((apss26::EXPERT_INTERMEDIATE_SIZE +
+                               BIG_BN - 1) / BIG_BN),
+        static_cast<unsigned>(max_work));
+    k_moe_pair_silu_grouped<<<pair_grid, block>>>(
+        compact_input.cuda_data(), weights.w1, weights.w3,
+        activated.cuda_data_write(), scratch.offsets,
+        scratch.work_expert, scratch.work_start, max_work,
+        h, apss26::EXPERT_INTERMEDIATE_SIZE);
+
+    Tensor expert_output({assignments, h});
+    const dim3 out_grid(
+        static_cast<unsigned>((h + BIG_BN - 1) / BIG_BN),
+        static_cast<unsigned>(max_work));
+    k_moe_matmul_grouped<<<out_grid, block>>>(
+        activated.cuda_data(), weights.w2, expert_output.cuda_data_write(),
+        scratch.offsets, scratch.work_expert, scratch.work_start,
+        max_work, apss26::EXPERT_INTERMEDIATE_SIZE, h);
+
+    out = Tensor({rows, h});
+    const std::size_t out_elems = rows * h;
+    k_moe_combine<<<(out_elems + 255) / 256, 256>>>(
+        expert_output.cuda_data(), scratch.routes,
+        scratch.route_positions, out.cuda_data_write(), rows, h);
+    check_cuda(cudaGetLastError(), "grouped MoE kernels launch");
 }
 
 void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {

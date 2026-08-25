@@ -89,6 +89,17 @@ PhiMoE::PhiMoE(const ModelLoader& loader, std::size_t layer_idx) {
     experts_.reserve(apss26::NUM_EXPERTS);
     for (std::size_t e = 0; e < apss26::NUM_EXPERTS; ++e)
         experts_.emplace_back(loader, base + ".experts." + std::to_string(e));
+    std::vector<const Tensor*> w1, w2, w3;
+    w1.reserve(apss26::NUM_EXPERTS);
+    w2.reserve(apss26::NUM_EXPERTS);
+    w3.reserve(apss26::NUM_EXPERTS);
+    for (const auto& expert : experts_) {
+        w1.push_back(&expert.w1());
+        w2.push_back(&expert.w2());
+        w3.push_back(&expert.w3());
+    }
+    gpu_weights_handle_ =
+        tensor_ops::register_moe_weights_gpu(w1, w2, w3);
 }
 
 void PhiMoE::forward(const Tensor& x, Tensor& y, bool use_gpu) const {
@@ -96,8 +107,12 @@ void PhiMoE::forward(const Tensor& x, Tensor& y, bool use_gpu) const {
     Tensor router({rows, apss26::NUM_EXPERTS});
     if (use_gpu) tensor_ops::matmul_transposed_gpu(x, gate_, router);
     else tensor_ops::matmul_transposed(x, gate_, router);
+    if (use_gpu) {
+        tensor_ops::moe_forward_grouped_gpu(
+            x, router, gpu_weights_handle_, y);
+        return;
+    }
     y = Tensor({rows, h});
-    if (use_gpu) tensor_ops::zero_gpu(y);
     std::vector<std::vector<std::pair<std::size_t, float>>> assignments(
         apss26::NUM_EXPERTS);
     Tensor one({apss26::NUM_EXPERTS});
@@ -113,25 +128,14 @@ void PhiMoE::forward(const Tensor& x, Tensor& y, bool use_gpu) const {
         if (assignments[e].empty()) continue;
         const std::size_t count = assignments[e].size();
         Tensor input({count, h}), output;
-        if (use_gpu) {
-            std::vector<std::size_t> token_rows(count);
-            for (std::size_t i = 0; i < count; ++i)
-                token_rows[i] = assignments[e][i].first;
-            tensor_ops::gather_rows_gpu(x, token_rows, input);
-            experts_[e].forward(input, output, true);
-            tensor_ops::scatter_add_rows_gpu(
-                output, token_rows, assignments[e][0].second, y);
-        } else {
-            for (std::size_t i = 0; i < count; ++i)
-                for (std::size_t j = 0; j < h; ++j)
-                    input.at(i, j) =
-                        x.at(assignments[e][i].first, j);
-            experts_[e].forward(input, output, false);
-            for (std::size_t i = 0; i < count; ++i)
-                for (std::size_t j = 0; j < h; ++j)
-                    y.at(assignments[e][i].first, j) +=
-                        assignments[e][i].second * output.at(i, j);
-        }
+        for (std::size_t i = 0; i < count; ++i)
+            for (std::size_t j = 0; j < h; ++j)
+                input.at(i, j) = x.at(assignments[e][i].first, j);
+        experts_[e].forward(input, output, false);
+        for (std::size_t i = 0; i < count; ++i)
+            for (std::size_t j = 0; j < h; ++j)
+                y.at(assignments[e][i].first, j) +=
+                    assignments[e][i].second * output.at(i, j);
     }
 }
 

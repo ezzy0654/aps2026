@@ -22,6 +22,9 @@ class PhiMLP {
 public:
     PhiMLP(const ModelLoader& loader, const std::string& prefix);
     void forward(const Tensor& x, Tensor& y, bool use_gpu = false) const;
+    const Tensor& w1() const { return w1_; }
+    const Tensor& w2() const { return w2_; }
+    const Tensor& w3() const { return w3_; }
 private:
     Tensor w1_, w2_, w3_;
 };
@@ -33,6 +36,7 @@ public:
 private:
     Tensor gate_;
     std::vector<PhiMLP> experts_;
+    std::size_t gpu_weights_handle_ = 0;
     void route(const Tensor& logits, std::vector<std::pair<int, float>>& routes) const;
 };
 
