@@ -45,6 +45,49 @@ LayerNorm/attention 단계 제출 결과:
 - 직전 개인 최고 대비: +6.9%
 - 제출 시점 순위: 2위 / 8명
 
+## Attention 구조적 병렬화 실험
+
+### 채택: cooperative K staging
+
+- query와 각 key의 dot product 누적은 기존 `d=0..127` 순서를 유지했다.
+- 128 threads가 key vector를 shared memory에 coalesced load한 뒤 thread 0이
+  같은 순서로 FP32 FMA를 수행했다.
+- n=1024 반복 결과는 6.094168초와 6.072704초였으며 모두 검증을 통과했다.
+
+### 폐기한 수치 병렬화
+
+| 실험 | n | 시간(초) | 검증 결과 |
+|---|---:|---:|---|
+| warp dot-product reduction | 64 | 0.696079 | FAILED, max diff 9.22422 |
+| 병렬 product + 순차 sum | 64 | 0.708780 | PASSED |
+| 병렬 product + 순차 sum | 1024 | 6.005037 | FAILED, max diff 0.0191498 |
+
+두 방식 모두 FP32 연산 순서를 바꿔 일부 MoE routing 결과에 영향을 줬으므로
+성능과 관계없이 폐기했다.
+
+### key 방향 병렬화
+
+서로 다른 key score는 softmax 전까지 독립이므로 warp별로 key를 배정하고,
+각 warp의 lane 0은 자기 score의 `d=0..127` 누적 순서를 그대로 유지했다.
+
+| 구성 | n=1024 시간(초) | attention kernel 합계 | 검증 | 판정 |
+|---|---:|---:|---|---|
+| 단순 K staging | 6.072704 | 0.484초 | PASSED | 채택 |
+| 4 warps / 4 keys | 6.071644 | 0.470초 | PASSED | 전체 이득 없음 |
+| 8 warps / 8 keys | 6.096911 | - | PASSED | 느림 |
+
+4-way는 attention kernel만 약 14ms 줄였지만 전체 시간에서는 측정 잡음 수준이었고
+코드와 shared-memory 요구량이 증가해 남기지 않았다.
+
+Attention 단계 최종 제출 결과:
+
+- elapsed: 6.092199초
+- throughput: 168.083798 seq/s
+- validation max abs diff: 0.0045929
+- validation mean abs diff: 1.3264e-05
+- 직전 개인 최고 대비: +3.0%
+- 제출 시점 순위: 2위 / 8명
+
 ## 변경 파일과 안전성
 
 - 구현 변경은 `src/tensor.cu`에 한정했다.

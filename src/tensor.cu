@@ -570,23 +570,28 @@ __global__ void k_attention(
     extern __shared__ float shared[];
     float* scores = shared;
     float* query = scores + max_seq;
+    float* key = query + head_dim;
     const std::size_t qbase = (row * q_heads + qh) * head_dim;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     if (threadIdx.x < head_dim)
         query[threadIdx.x] = q[qbase + threadIdx.x];
     __syncthreads();
-    if (threadIdx.x == 0) {
-        for (std::size_t w = 0; w < window; ++w) {
-            const std::size_t key_row =
-                static_cast<std::size_t>(seg_offset[row]) + begin + w;
-            const std::size_t kbase =
-                (key_row * kv_heads + kh) * head_dim;
+    for (std::size_t w = 0; w < window; ++w) {
+        const std::size_t key_row =
+            static_cast<std::size_t>(seg_offset[row]) + begin + w;
+        const std::size_t kbase =
+            (key_row * kv_heads + kh) * head_dim;
+        if (threadIdx.x < head_dim)
+            key[threadIdx.x] = k[kbase + threadIdx.x];
+        __syncthreads();
+        if (threadIdx.x == 0) {
             float score = 0.0f;
             for (std::size_t d = 0; d < head_dim; ++d)
-                score += query[d] * k[kbase + d];
+                score += query[d] * key[d];
             scores[w] = score * scale;
         }
+        __syncthreads();
     }
     if (threadIdx.x == 0) {
         float maxv = -3.402823466e+38F;
@@ -843,7 +848,7 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
                    std::size_t head_dim) {
     PackedMeta& meta = packed_meta(seq_lens);
     const std::size_t shared =
-        (meta.max_seq + 128) * sizeof(float);
+        (meta.max_seq + 2 * head_dim) * sizeof(float);
     k_attention<<<meta.rows * q_heads, 128, shared>>>(
         q.cuda_data(), k.cuda_data(), v.cuda_data(), out.cuda_data_write(),
         meta.offset, meta.pos, meta.rows, q_heads, kv_heads, head_dim,
