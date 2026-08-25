@@ -2,6 +2,7 @@
 #include "config.h"
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
 #include <unordered_map>
 #include <stdexcept>
 #include <vector>
@@ -72,16 +73,24 @@ void PhiTinyMoEModel::generate(
     // and run every row-wise op (LayerNorm, projections, MoE) on those. For
     // this input that is 19,803 token rows -> 15,583 nodes.
     //
-    // `token_node` maps each token row to its node (the expansion attention
-    // needs); `node_row` maps each node back to one representative token row.
-    // Rows sharing a node are bit-identical, so picking a representative is
-    // exact rather than an average.
-    std::vector<std::size_t> token_node(total), node_token, node_row;
+    // `token_node` maps each token row to its node. Attention runs directly on
+    // the node rows, so the trie walk also records, per node, its depth (which
+    // is its RoPE position) and its ancestor chain root -> node in depth order
+    // (which is exactly the set of keys its causal attention sees). Both are
+    // built here because this is where the trie already exists; the chain of a
+    // node created at position si is the running chain of the sequence being
+    // walked, so recording it costs one copy per node.
+    const std::size_t max_len =
+        *std::max_element(seq_lens.begin(), seq_lens.end());
+    std::vector<std::size_t> token_node(total), node_token, node_depth,
+        node_anc;
     node_token.reserve(total);
-    node_row.reserve(total);
+    node_depth.reserve(total);
+    node_anc.reserve(total * max_len);
     {
         std::unordered_map<std::uint64_t, std::uint32_t> children;
         children.reserve(total * 2);
+        std::vector<std::size_t> chain(max_len);
         for (std::size_t b = 0; b < batch; ++b) {
             std::uint32_t parent = 0xFFFFFFFFu;  // virtual root
             for (std::size_t si = 0; si < seq_lens[b]; ++si) {
@@ -96,10 +105,15 @@ void PhiTinyMoEModel::generate(
                 if (it == children.end()) {
                     node = static_cast<std::uint32_t>(node_token.size());
                     node_token.push_back(static_cast<std::size_t>(token));
-                    node_row.push_back(row);
+                    node_depth.push_back(si);
+                    chain[si] = node;
+                    node_anc.resize(node_anc.size() + max_len, 0);
+                    std::copy(chain.begin(), chain.begin() + si + 1,
+                              node_anc.end() - max_len);
                     children.emplace(key, node);
                 } else {
                     node = it->second;
+                    chain[si] = node;
                 }
                 token_node[row] = node;
                 parent = node;
@@ -118,12 +132,13 @@ void PhiTinyMoEModel::generate(
                     apss26::HIDDEN_SIZE * sizeof(float));
     }
 
-    const tensor_ops::RowIndexBuffer expand_rows(token_node);
-    const tensor_ops::RowIndexBuffer contract_rows(node_row);
+    const tensor_ops::RowIndexBuffer node_pos_rows(node_depth);
+    const tensor_ops::RowIndexBuffer node_anc_rows(node_anc);
     PrefixExpansion expansion;
-    expansion.expand = &expand_rows;
-    expansion.contract = &contract_rows;
-    expansion.num_tokens = total;
+    expansion.node_pos = &node_pos_rows;
+    expansion.node_anc = &node_anc_rows;
+    expansion.anc_stride = max_len;
+    expansion.max_seq = max_len;
 
     for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true, expansion); hidden = std::move(next); }
 

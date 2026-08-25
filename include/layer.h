@@ -45,16 +45,21 @@ private:
 // Prefix deduplication: sequences that share a prefix have bit-identical
 // hidden states there, so the residual stream carries one row per distinct
 // trie node instead of one per token. Every row-wise op (LayerNorm, the
-// projections, MoE) then runs on the deduplicated rows. Attention is the one
-// op that needs the full per-sequence layout, so the Q/K/V it consumes are
-// expanded through `expand` and its result contracted back through
-// `contract`. A default-constructed value (expand == nullptr) means no
-// deduplication and every path behaves exactly as before.
+// projections, MoE) then runs on the deduplicated rows.
+//
+// Attention runs on the node rows too. A node's causal context is exactly its
+// ancestor chain root -> node, which is unique per node, and its RoPE
+// position is its depth; `node_anc` lists that chain in depth order with
+// `anc_stride` entries per node and `node_pos` holds the depths. That makes
+// the per-layer expand-to-token-rows / contract-back round trip unnecessary.
+// A default-constructed value (node_anc == nullptr) means no deduplication
+// and every path behaves exactly as before.
 struct PrefixExpansion {
-    const tensor_ops::RowIndexBuffer* expand = nullptr;    // token row -> node row
-    const tensor_ops::RowIndexBuffer* contract = nullptr;  // node row -> token row
-    std::size_t num_tokens = 0;
-    bool active() const { return expand != nullptr; }
+    const tensor_ops::RowIndexBuffer* node_pos = nullptr;  // node row -> depth
+    const tensor_ops::RowIndexBuffer* node_anc = nullptr;  // node row -> chain
+    std::size_t anc_stride = 0;
+    std::size_t max_seq = 0;
+    bool active() const { return node_anc != nullptr; }
 };
 
 class PhiAttention {

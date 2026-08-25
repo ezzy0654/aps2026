@@ -171,25 +171,21 @@ void PhiAttention::forward(const Tensor& x, Tensor& y, const std::vector<std::si
     const std::size_t attn_heads_dim =
         apss26::NUM_ATTENTION_HEADS * apss26::HEAD_DIM;
     if (use_gpu && expansion.active()) {
-        // q/k/v currently hold one row per distinct prefix. RoPE and attention
-        // both index by packed per-sequence position, so materialize the full
-        // token layout for them and fold the duplicate rows back afterwards.
-        // Rows of `out_full` that map to the same node are bit-identical, so
-        // contracting is a representative pick, not a reduction.
-        const std::size_t t = expansion.num_tokens;
-        Tensor qe({t, q.size(1)}), ke({t, k.size(1)}), ve({t, v.size(1)});
-        tensor_ops::gather_rows_gpu(q, *expansion.expand, qe);
-        tensor_ops::gather_rows_gpu(k, *expansion.expand, ke);
-        tensor_ops::gather_rows_gpu(v, *expansion.expand, ve);
-        Tensor out_full({t, attn_heads_dim});
-        tensor_ops::apply_rope_gpu(
-            qe, ke, seq_lens, apss26::NUM_ATTENTION_HEADS,
-            apss26::NUM_KV_HEADS, apss26::HEAD_DIM, apss26::ROPE_THETA);
-        tensor_ops::attention_gpu(
-            qe, ke, ve, out_full, seq_lens, apss26::NUM_ATTENTION_HEADS,
-            apss26::NUM_KV_HEADS, apss26::HEAD_DIM);
+        // q/k/v hold one row per distinct prefix. Attention runs on those rows
+        // directly: a node's RoPE position is its depth and its causal context
+        // is its ancestor chain, so nothing has to be expanded to token rows.
+        // The per-head reduction orders match the token-row kernel exactly, so
+        // the result is bit-identical to expand -> attend -> contract.
         Tensor out({s, attn_heads_dim});
-        tensor_ops::gather_rows_gpu(out_full, *expansion.contract, out);
+        tensor_ops::apply_rope_tree_gpu(
+            q, k, expansion.node_pos->data(), s, expansion.max_seq,
+            apss26::NUM_ATTENTION_HEADS, apss26::NUM_KV_HEADS,
+            apss26::HEAD_DIM, apss26::ROPE_THETA);
+        tensor_ops::attention_tree_gpu(
+            q, k, v, out, expansion.node_pos->data(),
+            expansion.node_anc->data(), expansion.anc_stride, s,
+            expansion.max_seq, apss26::NUM_ATTENTION_HEADS,
+            apss26::NUM_KV_HEADS, apss26::HEAD_DIM);
         o_proj_.forward(out, y, true);
         return;
     }

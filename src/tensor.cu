@@ -1862,6 +1862,120 @@ __global__ void k_attention_grouped_gqa4(
     }
 }
 
+// Prefix-trie attention. With prefix deduplication the residual stream holds
+// one row per distinct trie node, so the keys a node attends to are not a
+// contiguous slice of the row dimension any more: they are exactly the node's
+// ancestor chain root -> node, which `anc[row * anc_stride + d]` lists in
+// depth order, and the node's RoPE position is its depth. Everything else --
+// the tile staging, the per-head reduction order, the softmax -- is identical
+// to k_attention_grouped_gqa4, so the results are bit-identical to expanding
+// to token rows, running that kernel, and contracting back.
+//
+// The chain is at most SLIDING_WINDOW long and is staged in shared memory
+// once per block, so the per-key indirection costs one coalesced uint32 read
+// per block rather than a dependent load per key. The key/value rows
+// themselves were already strided by kv_heads * head_dim, so replacing an
+// affine row index with a looked-up one does not change their coalescing:
+// each 128-float row is still one contiguous burst.
+__global__ void k_attention_tree_gqa4(
+    const float* q, const float* k, const float* v, float* out,
+    const std::uint32_t* row_pos, const std::uint32_t* anc,
+    std::size_t anc_stride, std::size_t rows, std::size_t q_heads,
+    std::size_t kv_heads, std::size_t head_dim, std::size_t max_seq) {
+    constexpr std::size_t group = 4;
+    const std::size_t task = blockIdx.x;
+    const std::size_t row = task / kv_heads;
+    const std::size_t kh = task % kv_heads;
+    if (row >= rows) return;
+    const std::size_t pos = row_pos[row];
+    const std::size_t begin =
+        pos + 1 > apss26::SLIDING_WINDOW
+            ? pos + 1 - apss26::SLIDING_WINDOW : 0;
+    const std::size_t window = pos - begin + 1;
+    extern __shared__ float shared[];
+    const std::size_t key_stride = head_dim + 1;
+    float* scores = shared;
+    float* queries = scores + group * max_seq;
+    float* keys = queries + group * head_dim;
+    std::uint32_t* chain = reinterpret_cast<std::uint32_t*>(
+        keys + ATTN_KEY_TILE * key_stride);
+    const std::size_t qh0 = kh * group;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    for (std::size_t i = threadIdx.x; i < window; i += blockDim.x)
+        chain[i] = anc[row * anc_stride + begin + i];
+    for (std::size_t i = threadIdx.x; i < group * head_dim;
+         i += blockDim.x) {
+        const std::size_t g = i / head_dim;
+        const std::size_t d = i % head_dim;
+        const std::size_t qbase = (row * q_heads + qh0 + g) * head_dim;
+        queries[d * group + g] = q[qbase + d];
+    }
+    __syncthreads();
+
+    const std::size_t g = threadIdx.x % group;
+    const std::size_t slot = threadIdx.x / group;
+    const float* my_query = queries + g;
+    for (std::size_t base = 0; base < window; base += ATTN_KEY_TILE) {
+        const std::size_t count = window - base < ATTN_KEY_TILE
+            ? window - base : ATTN_KEY_TILE;
+        for (std::size_t i = threadIdx.x; i < count * head_dim;
+             i += blockDim.x) {
+            const std::size_t ks = i / head_dim;
+            const std::size_t d = i % head_dim;
+            const std::size_t key_row = chain[base + ks];
+            const std::size_t kbase = (key_row * kv_heads + kh) * head_dim;
+            keys[ks * key_stride + d] = k[kbase + d];
+        }
+        __syncthreads();
+        if (slot < count) {
+            const float* my_key = keys + slot * key_stride;
+            float score = 0.0f;
+            for (std::size_t d = 0; d < head_dim; ++d)
+                score += my_query[d * group] * my_key[d];
+            scores[(base + slot) * group + g] = score * scale;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < group) {
+        const std::size_t gi = threadIdx.x;
+        float maxv = -3.402823466e+38F;
+        for (std::size_t w = 0; w < window; ++w)
+            maxv = fmaxf(maxv, scores[w * group + gi]);
+        float denom = 0.0f;
+        for (std::size_t w = 0; w < window; ++w) {
+            const float e = static_cast<float>(
+                exp(static_cast<double>(scores[w * group + gi] - maxv)));
+            scores[w * group + gi] = e;
+            denom += e;
+        }
+        for (std::size_t w = 0; w < window; ++w)
+            scores[w * group + gi] /= denom;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < head_dim) {
+        float value[group] = {};
+        for (std::size_t w = 0; w < window; ++w) {
+            const std::size_t key_row = chain[w];
+            const std::size_t vbase =
+                (key_row * kv_heads + kh) * head_dim;
+            const float vv = v[vbase + threadIdx.x];
+            const float* ws = scores + w * group;
+#pragma unroll
+            for (std::size_t gi = 0; gi < group; ++gi)
+                value[gi] += ws[gi] * vv;
+        }
+#pragma unroll
+        for (std::size_t gi = 0; gi < group; ++gi) {
+            const std::size_t qbase =
+                (row * q_heads + qh0 + gi) * head_dim;
+            out[qbase + threadIdx.x] = value[gi];
+        }
+    }
+}
+
 __global__ void k_gather_rows(
     const float* x, const std::uint32_t* rows, float* out,
     std::size_t count, std::size_t h) {
@@ -2354,6 +2468,43 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
             q_heads, kv_heads, head_dim, meta.max_seq);
         check_cuda(cudaGetLastError(), "k_attention launch");
     }
+}
+
+void apply_rope_tree_gpu(Tensor& q, Tensor& k,
+                         const std::uint32_t* row_pos, std::size_t rows,
+                         std::size_t max_seq, std::size_t q_heads,
+                         std::size_t kv_heads, std::size_t head_dim,
+                         float theta) {
+    RopeTable& table = rope_table(max_seq, head_dim, theta);
+    q.cuda_data();
+    k.cuda_data();
+    const std::size_t q_pairs = rows * q_heads * (head_dim / 2);
+    const std::size_t k_pairs = rows * kv_heads * (head_dim / 2);
+    k_rope<<<(q_pairs + 255) / 256, 256>>>(
+        q.cuda_data_write(), row_pos, table.cosine, table.sine,
+        rows, q_heads, head_dim);
+    k_rope<<<(k_pairs + 255) / 256, 256>>>(
+        k.cuda_data_write(), row_pos, table.cosine, table.sine,
+        rows, kv_heads, head_dim);
+    check_cuda(cudaGetLastError(), "k_rope(tree) launch");
+}
+
+void attention_tree_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
+                        Tensor& out, const std::uint32_t* row_pos,
+                        const std::uint32_t* anc, std::size_t anc_stride,
+                        std::size_t rows, std::size_t max_seq,
+                        std::size_t q_heads, std::size_t kv_heads,
+                        std::size_t head_dim) {
+    if (q_heads != 4 * kv_heads)
+        throw std::invalid_argument("attention_tree_gpu expects GQA-4");
+    const std::size_t shared =
+        (4 * max_seq + 4 * head_dim + ATTN_KEY_TILE * (head_dim + 1) +
+         max_seq) * sizeof(float);
+    k_attention_tree_gqa4<<<rows * kv_heads, 128, shared>>>(
+        q.cuda_data(), k.cuda_data(), v.cuda_data(), out.cuda_data_write(),
+        row_pos, anc, anc_stride, rows, q_heads, kv_heads, head_dim,
+        max_seq);
+    check_cuda(cudaGetLastError(), "k_attention_tree_gqa4 launch");
 }
 
 void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,
