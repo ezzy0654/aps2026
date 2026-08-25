@@ -63,6 +63,8 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c);   // [M,K] 
 // also packs the whole batch into one [total_tokens, HIDDEN] pass -- see
 // docs/issue.md #1/#3).
 void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c);
+void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
+                          const Tensor& up_weight, Tensor& out);
 void zero_gpu(Tensor& x);
 void add_inplace_gpu(Tensor& a, const Tensor& b);
 void add_bias_inplace_gpu(Tensor& a, const Tensor& bias);

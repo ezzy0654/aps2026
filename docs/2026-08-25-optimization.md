@@ -88,6 +88,33 @@ Attention 단계 최종 제출 결과:
 - 직전 개인 최고 대비: +3.0%
 - 제출 시점 순위: 2위 / 8명
 
+## MoE W1/W3 및 QKV fusion 실험
+
+### 채택: MoE W1/W3 + SiLU fusion
+
+Expert의 독립적인 W1 gate와 W3 up projection이 input shared-memory tile을
+공유하도록 구현했다. 두 accumulator는 기존 FP32 K 순서를 유지하고, 최종 store에서
+`SiLU(gate) * up`을 바로 계산한다.
+
+| 실행 | n | 시간(초) | 처리량(seq/s) | 검증 |
+|---|---:|---:|---:|---|
+| 1차 | 64 | 0.683109 | 93.689361 | PASSED |
+| 1차 | 1024 | 6.040400 | 169.525203 | PASSED |
+| 반복 | 1024 | 6.030337 | 169.808101 | PASSED |
+| 제출 | 1024 | 6.124946 | 167.185135 | PASSED |
+
+제출 측정은 변동으로 개인 최고 168.083798 seq/s를 넘지 못했다. 하지만 Nsight에서
+기존 register GEMM 3.550초 + SiLU 0.041초가 fused 버전의 기존 GEMM 2.580초 +
+pair-SiLU GEMM 0.967초로 줄어 약 44.6ms의 kernel 개선을 확인했다.
+
+### 폐기: QKV projection + bias fusion
+
+- Q 앞 512 columns와 K/V를 하나의 triple-accumulator kernel로 계산했다.
+- Q 나머지 1536 columns는 single-accumulator tail kernel로 계산했다.
+- input A tile을 공유하고 bias를 store에 합쳤으며 검증 오차는 기존과 동일했다.
+- n=64는 0.695918초, n=1024는 6.259094초로 MoE-only보다 느렸다.
+- Register pressure와 추가 synchronization 비용 때문에 코드를 제거했다.
+
 ## 변경 파일과 안전성
 
 - 구현 변경은 `src/tensor.cu`에 한정했다.

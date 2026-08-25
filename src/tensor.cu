@@ -453,6 +453,98 @@ __global__ void k_matmul_transposed_register_blocked(
         }
 }
 
+__global__ void k_matmul_pair_silu_register_blocked(
+    const float* __restrict__ a,
+    const float* __restrict__ gate_weight,
+    const float* __restrict__ up_weight,
+    float* __restrict__ out,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ float As[BIG_BM][BIG_BK + 1];
+    __shared__ float Bs[BIG_BN][BIG_BK + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * BIG_BX + tx;
+    const std::size_t row0 =
+        static_cast<std::size_t>(blockIdx.y) * BIG_BM + ty * BIG_TM;
+    const std::size_t col0 =
+        static_cast<std::size_t>(blockIdx.x) * BIG_BN + tx * BIG_TN;
+    float gate_acc[BIG_TM][BIG_TN] = {};
+    float up_acc[BIG_TM][BIG_TN] = {};
+
+    for (std::size_t p0 = 0; p0 < k; p0 += BIG_BK) {
+        for (int idx = tid; idx < BIG_BM * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lr = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t row =
+                static_cast<std::size_t>(blockIdx.y) * BIG_BM + lr;
+            const std::size_t p = p0 + lp;
+            As[lr][lp] = row < m && p < k ? a[row * k + p] : 0.0f;
+        }
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? gate_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p) {
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    gate_acc[r][cc] +=
+                        av * Bs[tx * BIG_TN + cc][p];
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < BIG_BN * BIG_BK;
+             idx += BIG_BX * BIG_BY) {
+            const int lc = idx / BIG_BK;
+            const int lp = idx % BIG_BK;
+            const std::size_t col =
+                static_cast<std::size_t>(blockIdx.x) * BIG_BN + lc;
+            const std::size_t p = p0 + lp;
+            Bs[lc][lp] = col < n && p < k
+                ? up_weight[col * k + p] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < BIG_BK; ++p) {
+#pragma unroll
+            for (int r = 0; r < BIG_TM; ++r) {
+                const float av = As[ty * BIG_TM + r][p];
+#pragma unroll
+                for (int cc = 0; cc < BIG_TN; ++cc)
+                    up_acc[r][cc] += av * Bs[tx * BIG_TN + cc][p];
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < BIG_TM; ++r)
+#pragma unroll
+        for (int cc = 0; cc < BIG_TN; ++cc) {
+            const std::size_t row = row0 + r;
+            const std::size_t col = col0 + cc;
+            if (row < m && col < n) {
+                const float x = gate_acc[r][cc];
+                const float activated = x /
+                    (1.0f + static_cast<float>(
+                        exp(static_cast<double>(-x))));
+                out[row * n + col] = activated * up_acc[r][cc];
+            }
+        }
+}
+
 __global__ void k_add(float* a, const float* b, std::size_t n) {
     const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] += b[i];
@@ -768,6 +860,32 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
             da, db, dc, m, k, n);
         check_cuda(cudaGetLastError(), "k_matmul_transposed_tiled launch");
     }
+}
+
+void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
+                          const Tensor& up_weight, Tensor& out) {
+    const std::size_t k = a.size(a.ndim() - 1);
+    const std::size_t m = a.size() / k;
+    const std::size_t n = gate_weight.size(0);
+    if (gate_weight.size(1) != k || up_weight.size(0) != n ||
+        up_weight.size(1) != k || out.size(0) != m || out.size(1) != n)
+        throw std::invalid_argument("matmul_pair_silu_gpu shape");
+    if (m < BIG_BM || n < BIG_BN) {
+        Tensor gate({m, n}), up({m, n});
+        matmul_transposed_gpu(a, gate_weight, gate);
+        matmul_transposed_gpu(a, up_weight, up);
+        silu_mul_gpu(gate, up, out);
+        return;
+    }
+    const dim3 block(BIG_BX, BIG_BY);
+    const dim3 grid(
+        static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
+        static_cast<unsigned>((m + BIG_BM - 1) / BIG_BM));
+    k_matmul_pair_silu_register_blocked<<<grid, block>>>(
+        a.cuda_data(), gate_weight.cuda_data(), up_weight.cuda_data(),
+        out.cuda_data_write(), m, k, n);
+    check_cuda(cudaGetLastError(),
+               "k_matmul_pair_silu_register_blocked launch");
 }
 
 void add_inplace_gpu(Tensor& a, const Tensor& b) {

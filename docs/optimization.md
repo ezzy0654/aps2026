@@ -140,6 +140,8 @@ allocation 비중이 크면 reusable workspace를 먼저 진행한다.
 - GEMM geometry sweep 결과 blockDim 32x8, output tile 64x64를 선택했다.
 - attention key를 cooperative하게 shared memory에 staging하면서 score 내부의
   FP32 누적 순서는 유지했다.
-- 최종 제출은 n=1024에서 6.092199초, 168.083798 seq/s, 검증 통과였다.
+- MoE expert W1/W3 projection이 input tile을 공유하고 SiLU×up을 fused store로
+  생성하도록 변경했다. QKV fusion은 정확도를 유지했지만 느려서 폐기했다.
+- 개인 최고 제출은 n=1024에서 6.092199초, 168.083798 seq/s, 검증 통과였다.
 - 상세 실험과 폐기한 reduction/key-parallel 결과는
   `2026-08-25-optimization.md`에 있다.

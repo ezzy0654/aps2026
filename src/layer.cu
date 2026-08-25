@@ -35,12 +35,13 @@ void PhiMLP::forward(const Tensor& x, Tensor& y, bool use_gpu) const {
     const std::size_t rows = x.size() / x.size(x.ndim() - 1);
     const auto mm = use_gpu ? tensor_ops::matmul_transposed_gpu
                             : tensor_ops::matmul_transposed;
-    Tensor gate({rows, w1_.size(0)}), up({rows, w3_.size(0)});
     Tensor activated({rows, w1_.size(0)});
-    mm(x, w1_, gate);
-    mm(x, w3_, up);
-    if (use_gpu) tensor_ops::silu_mul_gpu(gate, up, activated);
-    else {
+    if (use_gpu) {
+        tensor_ops::matmul_pair_silu_gpu(x, w1_, w3_, activated);
+    } else {
+        Tensor gate({rows, w1_.size(0)}), up({rows, w3_.size(0)});
+        mm(x, w1_, gate);
+        mm(x, w3_, up);
         tensor_ops::silu(gate, activated);
         tensor_ops::mul(activated, up, activated);
     }
