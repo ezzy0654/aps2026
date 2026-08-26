@@ -219,6 +219,15 @@ void gather_rows(const float* d_src, float* d_dst, const int* d_indices,
                  std::size_t num_rows, std::size_t row_width);
 void scatter_add_rows(float* d_dst, const float* d_src, const int* d_indices,
                       const float* d_weights, std::size_t num_rows, std::size_t row_width);
+// Direct token -> output scatter for MoE's top-2 combine: host_pos[2*t] and
+// host_pos[2*t+1] are the two rows of `d_out` holding token t's two expert
+// results (built by the caller while it flattens assignments into the
+// expert-major layout `d_out` already has). Replaces a 255 MB zero-fill plus
+// 16 serialized per-expert accumulate launches with one pass -- see the
+// kernel comment in tensor.cu for why the fixed 0.5/0.5 weights make this
+// exactly as order-independent as the memset+accumulate path it replaces.
+void scatter_pairs(const float* d_out, const int* host_pos, float* d_y,
+                   std::size_t rows, std::size_t row_width);
 
 // Device-pointer counterparts of the Tensor-based ops above. Same kernels,
 // minus the per-call upload/download — that transfer, not the arithmetic,

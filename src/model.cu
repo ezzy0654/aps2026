@@ -146,6 +146,15 @@ void PhiTinyMoEModel::forward_chunk(
         APS_PROFILE_SCOPE("model.lm_head");
         float* d_logits = device::buffer(device::Buffer::Output, chunk_batch * apss26::VOCAB_SIZE);
         { APS_PROFILE_SCOPE("mm.lm_head [B,4096]x[32064,4096]"); lm_head_.forward_device(d_last, d_logits, chunk_batch); }
+        // Tried routing this through a bulk D2H into a fresh host staging
+        // buffer plus a host-side gather, to replace chunk_batch separate
+        // cudaMemcpy calls with one. Measured worse both ways: a
+        // std::vector's zero-fill on first resize, or the first-touch page
+        // faults during the D2H itself for `new float[n]`, cost far more
+        // than the ~1023 calls' driver overhead this was meant to remove --
+        // `out`'s own backing memory is already resident (zero-filled once in
+        // generate()), so writing into it directly, as below, is what's
+        // actually cheap.
         for (std::size_t r = 0; r < chunk_batch; ++r) {
             device::check(cudaMemcpy(&out.at(dest_rows[r], 0),
                                      d_logits + r * apss26::VOCAB_SIZE,

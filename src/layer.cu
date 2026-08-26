@@ -182,6 +182,16 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     std::vector<float> all_w;
     std::vector<std::size_t> off(E + 1, 0);
     std::vector<device::GroupTile> tiles;
+    // scatter_pos[2*t] / scatter_pos[2*t+1]: the two d_out rows (see below)
+    // holding token t's two expert results, filled in as each token's
+    // assignment is flattened -- the "which of the two free slots" tracked
+    // by `slot_used`. This is what lets the final combine skip a device
+    // bucketing pass: it already knows, from this host loop, exactly where
+    // in d_out each token's pair landed.
+    static std::vector<int> scatter_pos;
+    static std::vector<unsigned char> slot_used;
+    scatter_pos.assign(2 * rows, -1);
+    slot_used.assign(rows, 0);
     {
         APS_PROFILE_SCOPE("moe.expert_setup");
         all_idx.reserve(2 * rows);
@@ -189,7 +199,10 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
         for (std::size_t e = 0; e < E; ++e) {
             off[e] = all_idx.size();
             for (const auto& a : assignments[e]) {
-                all_idx.push_back(static_cast<int>(a.first));
+                const std::size_t t = a.first;
+                scatter_pos[2 * t + slot_used[t]] = static_cast<int>(all_idx.size());
+                ++slot_used[t];
+                all_idx.push_back(static_cast<int>(t));
                 all_w.push_back(a.second);
             }
         }
@@ -244,23 +257,13 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     }
 
     {
-        // scatter_add_rows accumulates, so the destination must start at zero.
-        APS_PROFILE_SCOPE("moe.zero");
-        device::check(cudaMemset(d_y, 0, rows * h * sizeof(float)), "moe y zero");
-    }
-    {
-        // Deliberately NOT fused. A token routes to two experts, so two
-        // launches touch the same row of d_y; keeping them per-expert
-        // preserves both the race-freedom (indices distinct within a launch)
-        // and the expert-order accumulation the reference's rounding depends
-        // on. It already runs at ~82% of peak bandwidth anyway.
+        // Every token has exactly two entries in scatter_pos (its two expert
+        // picks), both weighted 0.5 -- an exact power of two -- so the sum is
+        // order-independent (see the kernel comment in tensor.cu) and this
+        // needs neither the up-front zero-fill nor per-expert launches: one
+        // pass over d_y's rows reads both of a token's positions directly.
         APS_PROFILE_SCOPE("moe.scatter");
-        for (std::size_t e = 0; e < E; ++e) {
-            const std::size_t count = off[e + 1] - off[e];
-            if (count == 0) continue;
-            device::scatter_add_rows(d_y, d_out + off[e] * h, d_idx + off[e],
-                                     d_w + off[e], count, h);
-        }
+        device::scatter_pairs(d_out, scatter_pos.data(), d_y, rows, h);
     }
 }
 

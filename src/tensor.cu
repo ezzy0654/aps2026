@@ -747,6 +747,75 @@ __global__ void layer_norm_fused_kernel(const float* __restrict__ x,
         y[base + j] = (s[j] - mean) * inv * weight[j] + bias[j];
 }
 
+// One warp per row instead of one block per row. layer_norm_fused_kernel
+// above stages a row whole (16 KB) so only ONE thread per block (lane/thread
+// 0) ever does the serial FADD chain; the other 255 threads stage the row
+// then sit parked at __syncthreads() until it finishes. Measured: 35 of 40
+// resident warps blocked there, 5 blocks/SM (16 KB shared each), 0.49
+// eligible warps/scheduler -- occupancy looks fine, almost nothing is
+// actually eligible to issue.
+//
+// Here each of a block's 8 warps owns a different row and streams it through
+// a 512-float shared tile (2 KB) rather than staging it whole, so 8 rows
+// cost the same 16 KB/block the old kernel spent on 1 -- blocks/SM is
+// unchanged, but each now runs 8 independent chains instead of 1 (~5x8=40
+// resident chains against the old 5). __syncwarp() replaces
+// __syncthreads(), so one warp's long chain never blocks the other 7.
+//
+// The price is reading the row twice more from DRAM (once per pass below,
+// where the old kernel read it once): mean and variance still can't share a
+// pass without changing the reduction to something order-dependent (a tree,
+// or a single-pass Sum(x^2) formula) -- both already rejected, see
+// matching-reference-numerics.md. Every accumulation is still one thread
+// walking j = 0..h-1 in the reference's order, so results are bit-identical;
+// only where the bytes come from, and how many other chains run alongside,
+// changes.
+__global__ void layer_norm_warp_kernel(const float* __restrict__ x,
+                                       const float* __restrict__ weight,
+                                       const float* __restrict__ bias,
+                                       float eps, float* __restrict__ y,
+                                       int h, std::size_t rows) {
+    constexpr int kTile = 512;
+    extern __shared__ float smem[];
+
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const std::size_t warps_per_block = blockDim.x >> 5;
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x) * warps_per_block + warp;
+    if (row >= rows) return;
+
+    float* tile = smem + static_cast<std::size_t>(warp) * kTile;
+    const float* xr = x + row * static_cast<std::size_t>(h);
+    const int ntiles = h / kTile;
+
+    float mean = 0.0f;
+    for (int t = 0; t < ntiles; ++t) {
+        for (int i = lane; i < kTile; i += 32) tile[i] = xr[t * kTile + i];
+        __syncwarp();
+        if (lane == 0)
+            for (int i = 0; i < kTile; ++i) mean += tile[i];
+        __syncwarp();
+    }
+    if (lane == 0) mean /= static_cast<float>(h);
+    mean = __shfl_sync(0xffffffffu, mean, 0);
+
+    float var = 0.0f;
+    for (int t = 0; t < ntiles; ++t) {
+        for (int i = lane; i < kTile; i += 32) tile[i] = xr[t * kTile + i];
+        __syncwarp();
+        if (lane == 0)
+            for (int i = 0; i < kTile; ++i) { const float d = tile[i] - mean; var += d * d; }
+        __syncwarp();
+    }
+    float inv = 0.0f;
+    if (lane == 0) inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
+    inv = __shfl_sync(0xffffffffu, inv, 0);
+
+    float* yr = y + row * static_cast<std::size_t>(h);
+    for (int j = lane; j < h; j += 32)
+        yr[j] = (xr[j] - mean) * inv * weight[j] + bias[j];
+}
+
 // Grow-on-demand storage for the per-row (mean, inv) pair. Two floats per
 // row -- 125 KB at this input's row count.
 struct StatsBuffer { float2* ptr = nullptr; std::size_t capacity = 0; };
@@ -755,6 +824,29 @@ StatsBuffer g_ln_stats;
 void launch_layer_norm(const float* x, const float* weight, const float* bias, float eps,
                        float* y, std::size_t rows, std::size_t h) {
     if (rows == 0 || h == 0) return;
+
+    // Warp-per-row path: needs h to divide evenly into 512-float tiles (true
+    // for this model's fixed h=4096) and blockIdx.x to cover all rows at 8
+    // warps/block.
+    constexpr int kTile = 512;
+    constexpr int kWarpsPerBlock = 8;
+    if (h % kTile == 0 &&
+        rows <= static_cast<std::size_t>(2147483647) * kWarpsPerBlock) {
+        static bool carveout_set = false;
+        if (!carveout_set) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(layer_norm_warp_kernel),
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            carveout_set = true;
+        }
+        const unsigned blocks = static_cast<unsigned>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        const std::size_t shared_bytes =
+            static_cast<std::size_t>(kWarpsPerBlock) * kTile * sizeof(float);
+        layer_norm_warp_kernel<<<blocks, kWarpsPerBlock * 32, shared_bytes>>>(
+            x, weight, bias, eps, y, static_cast<int>(h), rows);
+        cuda_check(cudaGetLastError(), "layer_norm_warp kernel");
+        return;
+    }
 
     // Fused path: one block per row, row staged in shared. Needs h*4 bytes of
     // shared per block and a float4-aligned row stride; anything else (a huge
@@ -1169,6 +1261,34 @@ __global__ void route_top2_kernel(const float* __restrict__ logits,
 struct RoutePairBuffer { int2* ptr = nullptr; std::size_t capacity = 0; };
 RoutePairBuffer g_route_pairs;
 
+// y[t,:] = 0.5*out[pos[2t],:] + 0.5*out[pos[2t+1],:]. Replaces a memset of
+// d_y plus 16 serialized scatter_add_rows_kernel launches (one per expert,
+// in ascending expert-id order) with one launch over rows*row_width.
+//
+// Bit-identical to that path even though this reads both of a token's expert
+// outputs in one step rather than accumulating them in expert-id order,
+// because the weight is always exactly 0.5 -- a power of two -- so
+// 0.5f*out[...] never rounds (it only decrements the exponent). The old path
+// computed round(0.5*a) via the first launch (exact, since a+0 needs no
+// rounding either) then round(0.5*b + round(0.5*a)) via the second launch's
+// FMA; since round(0.5*a) == 0.5*a exactly, that is just
+// round(0.5*a_exact + 0.5*b_exact) -- the single correctly-rounded value
+// this kernel's own `0.5f*a + 0.5f*b` (fused into an FMA or not) computes,
+// regardless of which of a token's two experts pos[] lists first.
+__global__ void scatter_pairs_kernel(const float* __restrict__ out,
+                                     const int* __restrict__ pos,
+                                     float* __restrict__ y,
+                                     std::size_t rows, std::size_t row_width) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = rows * row_width;
+    if (idx >= total) return;
+    const std::size_t t = idx / row_width;
+    const std::size_t j = idx % row_width;
+    const std::size_t p0 = static_cast<std::size_t>(pos[2 * t]);
+    const std::size_t p1 = static_cast<std::size_t>(pos[2 * t + 1]);
+    y[idx] = 0.5f * out[p0 * row_width + j] + 0.5f * out[p1 * row_width + j];
+}
+
 // Dispatches on N: the register-blocked kernel pads N up to 64, so for the
 // MoE gate (N=16) the older 32-wide kernel wastes less. Both keep the same
 // K accumulation order and agree bitwise.
@@ -1568,6 +1688,29 @@ void scatter_add_rows(float* d_dst, const float* d_src, const int* d_indices, co
     const int blocks = static_cast<int>((total + threads - 1) / threads);
     scatter_add_rows_kernel<<<blocks, threads>>>(d_dst, d_src, d_indices, d_weights, num_rows, row_width);
     cuda_check(cudaGetLastError(), "scatter_add_rows kernel");
+}
+
+namespace {
+struct IntPosBuffer { int* ptr = nullptr; std::size_t capacity = 0; };
+IntPosBuffer g_scatter_pos;
+}  // namespace
+
+void scatter_pairs(const float* d_out, const int* host_pos, float* d_y,
+                   std::size_t rows, std::size_t row_width) {
+    if (rows == 0) return;
+    const std::size_t n = 2 * rows;
+    if (g_scatter_pos.capacity < n) {
+        if (g_scatter_pos.ptr) cudaFree(g_scatter_pos.ptr);
+        cuda_check(cudaMalloc(&g_scatter_pos.ptr, n * sizeof(int)), "scatter_pos cudaMalloc");
+        g_scatter_pos.capacity = n;
+    }
+    cuda_check(cudaMemcpy(g_scatter_pos.ptr, host_pos, n * sizeof(int), cudaMemcpyHostToDevice),
+              "scatter_pos H2D");
+    const std::size_t total = rows * row_width;
+    const int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    scatter_pairs_kernel<<<blocks, threads>>>(d_out, g_scatter_pos.ptr, d_y, rows, row_width);
+    cuda_check(cudaGetLastError(), "scatter_pairs kernel");
 }
 
 void add_inplace(float* d_a, const float* d_b, std::size_t n) {
