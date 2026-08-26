@@ -121,7 +121,28 @@ struct DeviceBufferBank {
 Tensor::Tensor(std::vector<std::size_t> shape) : shape_(std::move(shape)) {
     std::size_t n = 1;
     for (std::size_t d : shape_) n *= d;
-    data_.assign(n, 0.0f);
+    // data_'s allocator makes resize() allocation-only (see
+    // detail::DefaultInitAllocator in tensor.h), so this explicit fill is
+    // what actually zero-initialises -- same values, same single-threaded
+    // page-fault cost std::vector's own value-init would have paid. Every
+    // existing caller of Tensor(shape) is therefore unaffected; only
+    // uninitialized_parallel() below deliberately skips this.
+    data_.resize(n);
+    std::fill(data_.begin(), data_.end(), 0.0f);
+}
+
+// See the declaration in tensor.h for when this is (and is not) safe.
+Tensor Tensor::uninitialized_parallel(std::vector<std::size_t> shape) {
+    Tensor t;
+    t.shape_ = std::move(shape);
+    std::size_t n = 1;
+    for (std::size_t d : t.shape_) n *= d;
+    t.data_.resize(n);
+    float* p = t.data_.data();
+    const long ni = static_cast<long>(n);
+#pragma omp parallel for schedule(static)
+    for (long i = 0; i < ni; ++i) p[i] = 0.0f;
+    return t;
 }
 
 Tensor::~Tensor() { free_device(); }

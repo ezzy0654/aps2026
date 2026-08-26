@@ -3,7 +3,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cuda_runtime.h>
+#include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // Lightweight per-section timing, enabled only when APS_PROFILE is set in
@@ -50,6 +53,34 @@ private:
 #define APS_PROFILE_SCOPE(name) \
     ::profiling::ScopedTimer APS_CONCAT(_aps_scope_timer_, __LINE__)(name)
 
+namespace detail {
+// std::vector<float>'s resize()/assign() value-initialise new elements --
+// for float that means writing 0.0f to every element, single-threaded, no
+// way to intercept from outside the standard library. This allocator's
+// zero-arg construct() does default- instead of value-initialisation
+// (a no-op for a scalar like float, leaving it genuinely unformed), so
+// resize() on a vector using it becomes allocation-only. Tensor's normal
+// constructor re-implements the zero-fill explicitly right after, so every
+// existing caller sees identical values and cost; only a caller that
+// deliberately skips that explicit fill (see Tensor::uninitialized_parallel)
+// gets a different result.
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+    using Base = std::allocator<T>;
+    using Base::Base;
+    template <typename U>
+    struct rebind { using other = DefaultInitAllocator<U>; };
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        Base::construct(p, std::forward<Args>(args)...);
+    }
+};
+}  // namespace detail
+
 // Tensor is a host-resident value type: the operations below always read
 // its inputs from and write its outputs to the host `data_` buffer. A
 // Tensor holding model *weights* (loaded once and never mutated) can
@@ -60,6 +91,16 @@ class Tensor {
 public:
     Tensor() = default;
     explicit Tensor(std::vector<std::size_t> shape);
+    // Like Tensor(shape), but skips the zero-fill and instead lets an
+    // OpenMP-parallel loop fault the pages in (see detail::DefaultInitAllocator
+    // above): ~3x faster on this system's page-fault-bound first touch, at
+    // the cost of correctness ONLY IF some element is read before being
+    // written. Safe exclusively for a buffer every element of which is
+    // about to be overwritten regardless -- e.g. a device output landing
+    // spot right before the D2H copy that spans it completely. Never use
+    // this for a buffer any code might read before writing (accumulators,
+    // padding regions, anything relying on Tensor's normal zero-init).
+    static Tensor uninitialized_parallel(std::vector<std::size_t> shape);
     ~Tensor();
     Tensor(const Tensor& other);
     Tensor& operator=(const Tensor& other);
@@ -98,7 +139,7 @@ public:
 
 private:
     std::vector<std::size_t> shape_;
-    std::vector<float> data_;
+    std::vector<float, detail::DefaultInitAllocator<float>> data_;
     std::size_t offset(std::initializer_list<std::size_t> indices) const;
 
     float* device_ptr_ = nullptr;

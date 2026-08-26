@@ -173,7 +173,12 @@ void PhiTinyMoEModel::generate(
     if (profiling::enabled()) profiling::reset();
 
     const std::size_t batch = input_ids.size();
-    logits = Tensor({batch, apss26::VOCAB_SIZE});
+    // Every element of this buffer is overwritten below: forward_chunk's
+    // D2H loop writes exactly one full row per original sequence index,
+    // and chunks partition [0, batch) without gap or overlap. Safe to skip
+    // the zero-fill Tensor(shape) would otherwise pay for nothing -- see
+    // Tensor::uninitialized_parallel in tensor.h.
+    logits = Tensor::uninitialized_parallel({batch, apss26::VOCAB_SIZE});
 
     // Sort by length descending (remembering each sequence's original
     // index) before packing into chunks: main.cpp's own input-format
