@@ -675,6 +675,143 @@ k_matmul_transposed_wide_async(
         }
 }
 
+// 128x128 output tile, 8x8 accumulators per thread.
+//
+// The 64x128 kernel above reads 12 shared floats per 32 FMAs -- 1.5 bytes of
+// shared traffic per FLOP. An SM delivers 128 B/clk of shared memory against
+// 128 FP32 lanes, i.e. 1 byte per FLOP, so that ratio caps the kernel at two
+// thirds of peak however well it is scheduled; measured, it runs at 17.7
+// TFLOPS of 35.6. An 8x8 tile reads 16 floats per 64 FMAs -- exactly the
+// 1 B/FLOP the hardware supplies -- and each thread's eight values are
+// contiguous, so a K step costs four LDS.128 instead of twelve LDS.32.
+//
+// Contiguity is why the shared tiles are stored K-major (As[p][m], Bs[p][n]):
+// the transpose moves to the store side, which touches 16x fewer values than
+// the read side. cp.async cannot transpose, so the pipeline is the classic
+// one instead -- prefetch the next K tile into registers, store it into the
+// idle shared stage, consume the live stage -- which needs one barrier per K
+// tile rather than two.
+//
+// The K loop still walks p = 0, 1, ... K-1 in order into one accumulator per
+// output, so every value this kernel produces is bit-identical to the 64-wide
+// kernels it replaces. That is not cosmetic: the MoE router quantizes its
+// scores at 1e-3 with a 2e-2 tie margin, and a last-ulp change upstream flips
+// a token to a different expert.
+constexpr int T8_BM = 128;
+constexpr int T8_BN = 128;
+constexpr int T8_BK = 8;
+// Row pitch padding: the transposed stores of one K tile hit banks
+// (pitch * p + row) % 32, so a pitch that is 4 mod 32 spreads the two halves
+// of a thread pair across banks while keeping every float4 read 16B aligned.
+constexpr int T8_PITCH = T8_BM + 4;
+constexpr int T8_THREADS = 256;
+
+__global__ void __launch_bounds__(T8_THREADS, 2)
+k_matmul_transposed_8x8(
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ bias, float* __restrict__ c,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ __align__(16) float As[2][T8_BK][T8_PITCH];
+    __shared__ __align__(16) float Bs[2][T8_BK][T8_PITCH];
+
+    const int tid = threadIdx.x;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const std::size_t block_row =
+        static_cast<std::size_t>(blockIdx.y) * T8_BM;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * T8_BN;
+
+    // Staging: 128 rows x 8 K values = one float4 per thread per tile.
+    const int ld_row = tid >> 1;
+    const int ld_k = (tid & 1) * 4;
+    const std::size_t a_row = block_row + ld_row;
+    const bool a_live = a_row < m;
+    const float* __restrict__ a_src =
+        a + (a_live ? a_row : 0) * k + ld_k;
+    const float* __restrict__ b_src =
+        b + (block_col + ld_row) * k + ld_k;
+
+    float acc[8][8] = {};
+    float4 pa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 pb;
+
+    auto load = [&](std::size_t tile) {
+        const std::size_t p0 = tile * T8_BK;
+        if (a_live) pa = *reinterpret_cast<const float4*>(a_src + p0);
+        pb = *reinterpret_cast<const float4*>(b_src + p0);
+    };
+    auto store = [&](int stage) {
+        As[stage][ld_k + 0][ld_row] = pa.x;
+        As[stage][ld_k + 1][ld_row] = pa.y;
+        As[stage][ld_k + 2][ld_row] = pa.z;
+        As[stage][ld_k + 3][ld_row] = pa.w;
+        Bs[stage][ld_k + 0][ld_row] = pb.x;
+        Bs[stage][ld_k + 1][ld_row] = pb.y;
+        Bs[stage][ld_k + 2][ld_row] = pb.z;
+        Bs[stage][ld_k + 3][ld_row] = pb.w;
+    };
+
+    const std::size_t tiles = k / T8_BK;
+    load(0);
+    store(0);
+    if (tiles > 1) load(1);
+    __syncthreads();
+
+    for (std::size_t t = 0; t < tiles; ++t) {
+        const int stage = static_cast<int>(t & 1);
+        // Registers hold tile t+1; the stage it goes to was last read in
+        // iteration t-1, which the barrier below already closed out.
+        if (t + 1 < tiles) store(stage ^ 1);
+        if (t + 2 < tiles) load(t + 2);
+#pragma unroll
+        for (int p = 0; p < T8_BK; ++p) {
+            const float4 a0 = *reinterpret_cast<const float4*>(
+                &As[stage][p][ty * 4]);
+            const float4 a1 = *reinterpret_cast<const float4*>(
+                &As[stage][p][64 + ty * 4]);
+            const float4 b0 = *reinterpret_cast<const float4*>(
+                &Bs[stage][p][tx * 4]);
+            const float4 b1 = *reinterpret_cast<const float4*>(
+                &Bs[stage][p][64 + tx * 4]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w,
+                                 a1.x, a1.y, a1.z, a1.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w,
+                                 b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+#pragma unroll
+                for (int cc = 0; cc < 8; ++cc)
+                    acc[r][cc] += av[r] * bv[cc];
+        }
+        __syncthreads();
+    }
+
+    // The bias add rides in the epilogue: it is the same acc + bias[col] the
+    // separate k_add_bias pass computed, minus a 255 MB round trip per call.
+    float4 bias0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 bias1 = bias0;
+    if (bias != nullptr) {
+        bias0 = *reinterpret_cast<const float4*>(
+            bias + block_col + tx * 4);
+        bias1 = *reinterpret_cast<const float4*>(
+            bias + block_col + 64 + tx * 4);
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int lr = r < 4 ? ty * 4 + r : 64 + ty * 4 + (r - 4);
+        const std::size_t row = block_row + lr;
+        if (row >= m) continue;
+        float* __restrict__ crow = c + row * n + block_col;
+        *reinterpret_cast<float4*>(crow + tx * 4) =
+            make_float4(acc[r][0] + bias0.x, acc[r][1] + bias0.y,
+                        acc[r][2] + bias0.z, acc[r][3] + bias0.w);
+        *reinterpret_cast<float4*>(crow + 64 + tx * 4) =
+            make_float4(acc[r][4] + bias1.x, acc[r][5] + bias1.y,
+                        acc[r][6] + bias1.z, acc[r][7] + bias1.w);
+    }
+}
+
 __global__ void __launch_bounds__(BIG_BX * BIG_BY, 2)
 k_matmul_transposed_register_blocked_async(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -1595,62 +1732,172 @@ __global__ void k_silu_mul(
     }
 }
 
+// The mean and variance sums stay on one thread in ascending j: the router
+// downstream quantizes its scores at 1e-3 with a 2e-2 tie margin, so a
+// last-ulp change in a LayerNorm sum can flip a token's expert and move a
+// logit by ~0.08. What is safe to change is how the row gets in and out --
+// staging and write-back move 16 bytes per thread per step instead of 4.
+__device__ __forceinline__ void ln_stage(
+    const float* __restrict__ src, float* __restrict__ dst, std::size_t h) {
+    if ((h & 3u) == 0) {
+        const float4* __restrict__ s4 =
+            reinterpret_cast<const float4*>(src);
+        float4* __restrict__ d4 = reinterpret_cast<float4*>(dst);
+        for (std::size_t j = threadIdx.x; j < h / 4; j += blockDim.x)
+            d4[j] = s4[j];
+        return;
+    }
+    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
+        dst[j] = src[j];
+}
+
+__device__ __forceinline__ void ln_write(
+    const float* __restrict__ staged, const float* __restrict__ weight,
+    const float* __restrict__ bias, float* __restrict__ y, std::size_t h,
+    float mean, float inv) {
+    if ((h & 3u) == 0) {
+        const float4* __restrict__ s4 =
+            reinterpret_cast<const float4*>(staged);
+        const float4* __restrict__ w4 =
+            reinterpret_cast<const float4*>(weight);
+        const float4* __restrict__ b4 =
+            reinterpret_cast<const float4*>(bias);
+        float4* __restrict__ y4 = reinterpret_cast<float4*>(y);
+        for (std::size_t j = threadIdx.x; j < h / 4; j += blockDim.x) {
+            const float4 s = s4[j], w = w4[j], b = b4[j];
+            float4 o;
+            o.x = (s.x - mean) * inv * w.x + b.x;
+            o.y = (s.y - mean) * inv * w.y + b.y;
+            o.z = (s.z - mean) * inv * w.z + b.z;
+            o.w = (s.w - mean) * inv * w.w + b.w;
+            y4[j] = o;
+        }
+        return;
+    }
+    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
+        y[j] = (staged[j] - mean) * inv * weight[j] + bias[j];
+}
+
+// Both sums keep ascending-j order -- that order is load bearing (see above).
+// What changes is the load pattern feeding it: one scalar shared load per add
+// leaves the accumulator waiting on LDS latency every step, so pull sixteen
+// values in four float4 loads and then run the adds back to back. Same
+// additions in the same sequence, latency hidden between them.
+__device__ __forceinline__ float ln_serial_sum(
+    const float* __restrict__ s, std::size_t h) {
+    float sum = 0.0f;
+    std::size_t j = 0;
+    if ((h & 15u) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(s) & 15u) == 0) {
+        const float4* __restrict__ s4 = reinterpret_cast<const float4*>(s);
+        for (std::size_t v = 0; v < h / 4; v += 4) {
+            const float4 a = s4[v], b = s4[v + 1];
+            const float4 c = s4[v + 2], d = s4[v + 3];
+            sum += a.x; sum += a.y; sum += a.z; sum += a.w;
+            sum += b.x; sum += b.y; sum += b.z; sum += b.w;
+            sum += c.x; sum += c.y; sum += c.z; sum += c.w;
+            sum += d.x; sum += d.y; sum += d.z; sum += d.w;
+        }
+        j = h;
+    }
+    for (; j < h; ++j) sum += s[j];
+    return sum;
+}
+
+__device__ __forceinline__ float ln_serial_var(
+    const float* __restrict__ s, std::size_t h, float m) {
+    float var = 0.0f;
+    std::size_t j = 0;
+    if ((h & 15u) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(s) & 15u) == 0) {
+        const float4* __restrict__ s4 = reinterpret_cast<const float4*>(s);
+        for (std::size_t v = 0; v < h / 4; v += 4) {
+            const float4 a = s4[v], b = s4[v + 1];
+            const float4 c = s4[v + 2], d = s4[v + 3];
+            float t;
+            t = a.x - m; var += t * t;
+            t = a.y - m; var += t * t;
+            t = a.z - m; var += t * t;
+            t = a.w - m; var += t * t;
+            t = b.x - m; var += t * t;
+            t = b.y - m; var += t * t;
+            t = b.z - m; var += t * t;
+            t = b.w - m; var += t * t;
+            t = c.x - m; var += t * t;
+            t = c.y - m; var += t * t;
+            t = c.z - m; var += t * t;
+            t = c.w - m; var += t * t;
+            t = d.x - m; var += t * t;
+            t = d.y - m; var += t * t;
+            t = d.z - m; var += t * t;
+            t = d.w - m; var += t * t;
+        }
+        j = h;
+    }
+    for (; j < h; ++j) {
+        const float d = s[j] - m;
+        var += d * d;
+    }
+    return var;
+}
+
+__device__ __forceinline__ void ln_moments(
+    const float* __restrict__ staged, std::size_t h, float eps,
+    float& mean, float& inv) {
+    const float m = ln_serial_sum(staged, h) / static_cast<float>(h);
+    mean = m;
+    inv = 1.0f / sqrtf(
+        ln_serial_var(staged, h, m) / static_cast<float>(h) + eps);
+}
+
 __global__ void k_layer_norm(
     const float* x, const float* weight, const float* bias, float* y,
     std::size_t h, float eps) {
     const std::size_t base = static_cast<std::size_t>(blockIdx.x) * h;
-    extern __shared__ float staged[];
+    extern __shared__ __align__(16) float staged[];
     __shared__ float mean;
     __shared__ float inv;
-    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
-        staged[j] = x[base + j];
+    ln_stage(x + base, staged, h);
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) sum += staged[j];
-        mean = sum / static_cast<float>(h);
-        float var = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) {
-            const float d = staged[j] - mean;
-            var += d * d;
-        }
-        inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
-    }
+    if (threadIdx.x == 0) ln_moments(staged, h, eps, mean, inv);
     __syncthreads();
-    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
-        y[base + j] =
-            (staged[j] - mean) * inv * weight[j] + bias[j];
+    ln_write(staged, weight, bias, y + base, h, mean, inv);
 }
 
 __global__ void k_add_layer_norm(
     float* x, const float* residual, const float* weight, const float* bias,
     float* y, std::size_t h, float eps) {
     const std::size_t base = static_cast<std::size_t>(blockIdx.x) * h;
-    extern __shared__ float staged[];
-    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x) {
-        const float value = x[base + j] + residual[base + j];
-        x[base + j] = value;
-        staged[j] = value;
+    extern __shared__ __align__(16) float staged[];
+    if ((h & 3u) == 0) {
+        float4* __restrict__ x4 = reinterpret_cast<float4*>(x + base);
+        const float4* __restrict__ r4 =
+            reinterpret_cast<const float4*>(residual + base);
+        float4* __restrict__ s4 = reinterpret_cast<float4*>(staged);
+        for (std::size_t j = threadIdx.x; j < h / 4; j += blockDim.x) {
+            const float4 a = x4[j], r = r4[j];
+            float4 v;
+            v.x = a.x + r.x;
+            v.y = a.y + r.y;
+            v.z = a.z + r.z;
+            v.w = a.w + r.w;
+            x4[j] = v;
+            s4[j] = v;
+        }
+    } else {
+        for (std::size_t j = threadIdx.x; j < h; j += blockDim.x) {
+            const float value = x[base + j] + residual[base + j];
+            x[base + j] = value;
+            staged[j] = value;
+        }
     }
     __syncthreads();
 
     __shared__ float mean;
     __shared__ float inv;
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) sum += staged[j];
-        mean = sum / static_cast<float>(h);
-        float var = 0.0f;
-        for (std::size_t j = 0; j < h; ++j) {
-            const float d = staged[j] - mean;
-            var += d * d;
-        }
-        inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
-    }
+    if (threadIdx.x == 0) ln_moments(staged, h, eps, mean, inv);
     __syncthreads();
-    for (std::size_t j = threadIdx.x; j < h; j += blockDim.x)
-        y[base + j] =
-            (staged[j] - mean) * inv * weight[j] + bias[j];
+    ln_write(staged, weight, bias, y + base, h, mean, inv);
 }
 
 __global__ void k_rope(
@@ -2226,6 +2473,25 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
     check_cuda(cudaGetLastError(), "grouped MoE kernels launch");
 }
 
+namespace {
+bool try_matmul_8x8(const float* da, const float* db, const float* dbias,
+                    float* dc, std::size_t m, std::size_t k, std::size_t n) {
+    if (n % T8_BN != 0 || k % T8_BK != 0 || m < T8_BM) return false;
+    static const bool t8_carveout = [] {
+        prefer_shared_carveout(
+            reinterpret_cast<const void*>(k_matmul_transposed_8x8));
+        return true;
+    }();
+    (void)t8_carveout;
+    const dim3 grid(static_cast<unsigned>(n / T8_BN),
+                    static_cast<unsigned>((m + T8_BM - 1) / T8_BM));
+    k_matmul_transposed_8x8<<<grid, T8_THREADS>>>(
+        da, db, dbias, dc, m, k, n);
+    check_cuda(cudaGetLastError(), "k_matmul_transposed_8x8 launch");
+    return true;
+}
+}  // namespace
+
 void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
     const std::size_t k = a.size(a.ndim() - 1);
     const std::size_t m = a.size() / k;
@@ -2249,6 +2515,7 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
     }
 #endif
     const float* db = b.cuda_data();
+    if (try_matmul_8x8(da, db, nullptr, dc, m, k, n)) return;
     if (m >= BIG_BM && n >= BIG_BN) {
         const dim3 block(BIG_BX, BIG_BY);
         const dim3 grid(
@@ -2296,6 +2563,31 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
     }
 }
 
+// Same GEMM with the Linear bias folded into the epilogue.
+void matmul_transposed_bias_gpu(const Tensor& a, const Tensor& b,
+                                const Tensor& bias, Tensor& c) {
+    const std::size_t k = a.size(a.ndim() - 1);
+    const std::size_t m = a.size() / k;
+    const std::size_t n = b.size(0);
+    if (b.size(1) != k || c.size(0) != m || c.size(1) != n ||
+        bias.size() != n)
+        throw std::invalid_argument("matmul_transposed_bias_gpu shape");
+    const bool fusable =
+#ifdef USE_TC
+        !b.has_cuda_bf16_weight() &&
+#endif
+        true;
+    if (fusable) {
+        const float* da = a.cuda_data();
+        const float* db = b.cuda_data();
+        const float* dbias = bias.cuda_data();
+        if (try_matmul_8x8(da, db, dbias, c.cuda_data_write(), m, k, n))
+            return;
+    }
+    matmul_transposed_gpu(a, b, c);
+    add_bias_inplace_gpu(c, bias);
+}
+
 void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
                           const Tensor& up_weight, Tensor& out) {
     const std::size_t k = a.size(a.ndim() - 1);
@@ -2336,6 +2628,20 @@ void matmul_pair_bias_gpu(const Tensor& a,
         first_out.size(1) != n || second_out.size(0) != m ||
         second_out.size(1) != n)
         throw std::invalid_argument("matmul_pair_bias_gpu shape");
+    // Two bias-fused 8x8 passes beat one 8x4 pass that shares the A tile:
+    // the pair kernel's win is halved A traffic, which L2 already absorbs,
+    // while its 12-loads-per-32-FMA ratio caps it below the 8x8 kernel.
+    {
+        const float* da = a.cuda_data();
+        if (try_matmul_8x8(da, first_weight.cuda_data(),
+                           first_bias.cuda_data(),
+                           first_out.cuda_data_write(), m, k, n)) {
+            try_matmul_8x8(da, second_weight.cuda_data(),
+                           second_bias.cuda_data(),
+                           second_out.cuda_data_write(), m, k, n);
+            return;
+        }
+    }
     if (m < BIG_BM || n < BIG_BN) {
         matmul_transposed_gpu(a, first_weight, first_out);
         add_bias_inplace_gpu(first_out, first_bias);
@@ -2404,6 +2710,14 @@ void layer_norm_gpu(const Tensor& x, const Tensor& weight, const Tensor& bias,
     const std::size_t rows = x.size() / h;
     if (weight.size() != h || bias.size() != h || y.size() != x.size())
         throw std::invalid_argument("layer norm shape");
+    static const bool ln_carveout = [] {
+        prefer_shared_carveout(
+            reinterpret_cast<const void*>(k_layer_norm));
+        prefer_shared_carveout(
+            reinterpret_cast<const void*>(k_add_layer_norm));
+        return true;
+    }();
+    (void)ln_carveout;
     k_layer_norm<<<rows, 256, h * sizeof(float)>>>(
         x.cuda_data(), weight.cuda_data(), bias.cuda_data(),
         y.cuda_data_write(), h, eps);

@@ -30,12 +30,15 @@ Linear::Linear(const ModelLoader& loader, const std::string& weight, const std::
 void Linear::forward(const Tensor& x, Tensor& y, bool use_gpu) const {
     const std::size_t rows = x.size() / x.size(x.ndim() - 1);
     y = Tensor({rows, weight_.size(0)});
-    if (use_gpu) tensor_ops::matmul_transposed_gpu(x, weight_, y);
-    else tensor_ops::matmul_transposed(x, weight_, y);
-    if (bias_.size()) {
-        if (use_gpu) tensor_ops::add_bias_inplace_gpu(y, bias_);
-        else tensor_ops::add_bias_inplace(y, bias_);
+    if (use_gpu) {
+        if (bias_.size())
+            tensor_ops::matmul_transposed_bias_gpu(x, weight_, bias_, y);
+        else
+            tensor_ops::matmul_transposed_gpu(x, weight_, y);
+        return;
     }
+    tensor_ops::matmul_transposed(x, weight_, y);
+    if (bias_.size()) tensor_ops::add_bias_inplace(y, bias_);
 }
 
 PhiMLP::PhiMLP(const ModelLoader& loader, const std::string& prefix)
