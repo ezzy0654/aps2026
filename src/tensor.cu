@@ -706,6 +706,11 @@ constexpr int T8_BK = 8;
 constexpr int T8_PITCH = T8_BM + 4;
 constexpr int T8_THREADS = 256;
 
+// RAGGED is a compile-time switch, not a runtime flag: the full-tile
+// instantiation must keep the exact codegen it had before column guards
+// existed. Predicating the prefetch load costs the hot q/k/v/o launches
+// more than the ragged lm_head tail gains -- measured at 1.2% end to end.
+template <bool RAGGED>
 __global__ void __launch_bounds__(T8_THREADS, 2)
 k_matmul_transposed_8x8(
     const float* __restrict__ a, const float* __restrict__ b,
@@ -729,17 +734,19 @@ k_matmul_transposed_8x8(
     const bool a_live = a_row < m;
     const float* __restrict__ a_src =
         a + (a_live ? a_row : 0) * k + ld_k;
+    const std::size_t b_col = block_col + ld_row;
+    const bool b_live = !RAGGED || b_col < n;
     const float* __restrict__ b_src =
-        b + (block_col + ld_row) * k + ld_k;
+        b + (b_live ? b_col : 0) * k + ld_k;
 
     float acc[8][8] = {};
     float4 pa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 pb;
+    float4 pb = pa;
 
     auto load = [&](std::size_t tile) {
         const std::size_t p0 = tile * T8_BK;
         if (a_live) pa = *reinterpret_cast<const float4*>(a_src + p0);
-        pb = *reinterpret_cast<const float4*>(b_src + p0);
+        if (b_live) pb = *reinterpret_cast<const float4*>(b_src + p0);
     };
     auto store = [&](int stage) {
         As[stage][ld_k + 0][ld_row] = pa.x;
@@ -789,26 +796,37 @@ k_matmul_transposed_8x8(
 
     // The bias add rides in the epilogue: it is the same acc + bias[col] the
     // separate k_add_bias pass computed, minus a 255 MB round trip per call.
+    // Column guards let N be any multiple of 4 instead of a multiple of 128.
+    // lm_head is n = 32064 -- 250 full tiles and a half tile -- which used to
+    // miss this kernel entirely and fall back to the 12.3 TFLOPS path.
+    // Guarding costs two predicates per store and nothing on the full tiles
+    // that every other projection uses.
+    const std::size_t col0 = block_col + tx * 4;
+    const std::size_t col1 = block_col + 64 + tx * 4;
+    const bool col0_live = !RAGGED || col0 < n;
+    const bool col1_live = !RAGGED || col1 < n;
     float4 bias0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 bias1 = bias0;
     if (bias != nullptr) {
-        bias0 = *reinterpret_cast<const float4*>(
-            bias + block_col + tx * 4);
-        bias1 = *reinterpret_cast<const float4*>(
-            bias + block_col + 64 + tx * 4);
+        if (col0_live)
+            bias0 = *reinterpret_cast<const float4*>(bias + col0);
+        if (col1_live)
+            bias1 = *reinterpret_cast<const float4*>(bias + col1);
     }
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int lr = r < 4 ? ty * 4 + r : 64 + ty * 4 + (r - 4);
         const std::size_t row = block_row + lr;
         if (row >= m) continue;
-        float* __restrict__ crow = c + row * n + block_col;
-        *reinterpret_cast<float4*>(crow + tx * 4) =
-            make_float4(acc[r][0] + bias0.x, acc[r][1] + bias0.y,
-                        acc[r][2] + bias0.z, acc[r][3] + bias0.w);
-        *reinterpret_cast<float4*>(crow + 64 + tx * 4) =
-            make_float4(acc[r][4] + bias1.x, acc[r][5] + bias1.y,
-                        acc[r][6] + bias1.z, acc[r][7] + bias1.w);
+        float* __restrict__ crow = c + row * n;
+        if (col0_live)
+            *reinterpret_cast<float4*>(crow + col0) =
+                make_float4(acc[r][0] + bias0.x, acc[r][1] + bias0.y,
+                            acc[r][2] + bias0.z, acc[r][3] + bias0.w);
+        if (col1_live)
+            *reinterpret_cast<float4*>(crow + col1) =
+                make_float4(acc[r][4] + bias1.x, acc[r][5] + bias1.y,
+                            acc[r][6] + bias1.z, acc[r][7] + bias1.w);
     }
 }
 
@@ -2181,7 +2199,11 @@ __global__ void k_rope(
 // One key slot per four threads. 16 keys x 4 heads keeps the staged tile
 // small enough that occupancy stays ahead of the barrier saving; 32 was
 // measured slower because the extra shared memory cost more residency than
-// the deeper tile bought.
+// the deeper tile bought. 8 was also measured slower (duration +15.6%,
+// barrier stall +25%): the relaxed shared-mem occupancy limit (8->12
+// blocks/SM) didn't even translate into higher achieved occupancy, while
+// twice as many __syncthreads() per window cost more than that bought. 16
+// is the confirmed sweet spot on both sides.
 constexpr std::size_t ATTN_KEY_TILE = 16;
 
 __global__ void k_attention(
@@ -2321,8 +2343,25 @@ __global__ void k_attention_grouped_gqa4(
         __syncthreads();
         if (slot < count) {
             const float* my_key = keys + slot * key_stride;
-            float score = 0.0f;
-            for (std::size_t d = 0; d < head_dim; ++d)
+            // Single-accumulator dot product chains every FMA on the
+            // previous one's result -- the loop can't issue faster than
+            // FMA latency regardless of head_dim. Four independent
+            // accumulators break that chain so the compiler can keep
+            // several FMAs in flight (bounded by throughput, not
+            // latency); reduction order changes, but this is a plain
+            // dot product, not the ascending-w softmax sums elsewhere
+            // that are order-critical for the reference match.
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            std::size_t d = 0;
+#pragma unroll
+            for (; d + 4 <= head_dim; d += 4) {
+                acc0 += my_query[(d + 0) * group] * my_key[d + 0];
+                acc1 += my_query[(d + 1) * group] * my_key[d + 1];
+                acc2 += my_query[(d + 2) * group] * my_key[d + 2];
+                acc3 += my_query[(d + 3) * group] * my_key[d + 3];
+            }
+            float score = (acc0 + acc1) + (acc2 + acc3);
+            for (; d < head_dim; ++d)
                 score += my_query[d * group] * my_key[d];
             scores[(base + slot) * group + g] = score * scale;
         }
@@ -2425,8 +2464,36 @@ __global__ void k_attention_tree_gqa4(
     for (std::size_t base = 0; base < window; base += ATTN_KEY_TILE) {
         const std::size_t count = window - base < ATTN_KEY_TILE
             ? window - base : ATTN_KEY_TILE;
-        for (std::size_t i = threadIdx.x; i < count * head_dim;
-             i += blockDim.x) {
+        // chain[] is already in shared memory (staged above), so the
+        // expensive part here is k[kbase + d] -- one long-latency global
+        // load per thread per step, issued and then immediately consumed
+        // by nothing until the next barrier. Compute KSTEP addresses and
+        // issue all their loads before storing any of them, so KSTEP
+        // long-latency loads are in flight together instead of one at a
+        // time (same idea as the VSTEP batching on the V-accumulation
+        // loop below).
+        constexpr std::size_t KSTEP = 4;
+        const std::size_t total = count * head_dim;
+        std::size_t i = threadIdx.x;
+        for (; i + KSTEP * blockDim.x <= total; i += KSTEP * blockDim.x) {
+            float vv[KSTEP];
+            std::size_t ii[KSTEP];
+#pragma unroll
+            for (std::size_t j = 0; j < KSTEP; ++j) {
+                ii[j] = i + j * blockDim.x;
+                const std::size_t ks = ii[j] / head_dim;
+                const std::size_t d = ii[j] % head_dim;
+                const std::size_t key_row = chain[base + ks];
+                const std::size_t kbase =
+                    (key_row * kv_heads + kh) * head_dim;
+                vv[j] = k[kbase + d];
+            }
+#pragma unroll
+            for (std::size_t j = 0; j < KSTEP; ++j)
+                keys[(ii[j] / head_dim) * key_stride + ii[j] % head_dim] =
+                    vv[j];
+        }
+        for (; i < total; i += blockDim.x) {
             const std::size_t ks = i / head_dim;
             const std::size_t d = i % head_dim;
             const std::size_t key_row = chain[base + ks];
@@ -2436,8 +2503,25 @@ __global__ void k_attention_tree_gqa4(
         __syncthreads();
         if (slot < count) {
             const float* my_key = keys + slot * key_stride;
-            float score = 0.0f;
-            for (std::size_t d = 0; d < head_dim; ++d)
+            // Single-accumulator dot product chains every FMA on the
+            // previous one's result -- the loop can't issue faster than
+            // FMA latency regardless of head_dim. Four independent
+            // accumulators break that chain so the compiler can keep
+            // several FMAs in flight (bounded by throughput, not
+            // latency); reduction order changes, but this is a plain
+            // dot product, not the ascending-w softmax sums elsewhere
+            // that are order-critical for the reference match.
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            std::size_t d = 0;
+#pragma unroll
+            for (; d + 4 <= head_dim; d += 4) {
+                acc0 += my_query[(d + 0) * group] * my_key[d + 0];
+                acc1 += my_query[(d + 1) * group] * my_key[d + 1];
+                acc2 += my_query[(d + 2) * group] * my_key[d + 2];
+                acc3 += my_query[(d + 3) * group] * my_key[d + 3];
+            }
+            float score = (acc0 + acc1) + (acc2 + acc3);
+            for (; d < head_dim; ++d)
                 score += my_query[d * group] * my_key[d];
             scores[(base + slot) * group + g] = score * scale;
         }
@@ -2454,36 +2538,86 @@ __global__ void k_attention_tree_gqa4(
     // cannot change the value. Spread the window x group exponentials over
     // the whole block and leave on one thread only what has an order to
     // preserve: the running denominator sum in ascending w.
+    //
+    // fmaxf is associative and commutative on finite inputs, so unlike that
+    // denominator sum this reduction may be reshaped freely. It used to run
+    // on `group` threads scanning the window serially; one warp with eight
+    // partials plus three shuffles does the same work in window/8 + 3 steps
+    // and adds no barrier. Lane l holds gi = l & 3, slot = l >> 2, so the
+    // scan reads scores[l + 32 * it] -- one coalesced sector per step -- and
+    // the XOR-4/8/16 butterfly folds the eight slots of a fixed gi together.
     __shared__ float maxv_s[group];
-    if (threadIdx.x < group) {
-        const std::size_t gi = threadIdx.x;
+    if (threadIdx.x < 32) {
+        const std::size_t gi = threadIdx.x & 3;
+        const std::size_t slot = threadIdx.x >> 2;
         float maxv = -3.402823466e+38F;
-        for (std::size_t w = 0; w < window; ++w)
+        for (std::size_t w = slot; w < window; w += 8)
             maxv = fmaxf(maxv, scores[w * group + gi]);
-        maxv_s[gi] = maxv;
+        maxv = fmaxf(maxv, __shfl_xor_sync(0xffffffffu, maxv, 4));
+        maxv = fmaxf(maxv, __shfl_xor_sync(0xffffffffu, maxv, 8));
+        maxv = fmaxf(maxv, __shfl_xor_sync(0xffffffffu, maxv, 16));
+        if (slot == 0) maxv_s[gi] = maxv;
     }
     __syncthreads();
     for (std::size_t i = threadIdx.x; i < window * group; i += blockDim.x)
         scores[i] = static_cast<float>(
             exp(static_cast<double>(scores[i] - maxv_s[i % group])));
     __syncthreads();
+    __shared__ float denom_s[group];
     if (threadIdx.x < group) {
         const std::size_t gi = threadIdx.x;
         float denom = 0.0f;
+        // Order-critical: the reference sums the window in ascending w into
+        // one accumulator. This stays on one thread per group.
         for (std::size_t w = 0; w < window; ++w)
             denom += scores[w * group + gi];
-        for (std::size_t w = 0; w < window; ++w)
-            scores[w * group + gi] /= denom;
+        denom_s[gi] = denom;
     }
+    __syncthreads();
+    // The normalisation is not a reduction -- it is an elementwise map, a
+    // pure function of one score and its group's denominator, so which
+    // thread evaluates it cannot change the value. Same treatment the exp
+    // loop above already gets: spread window x group over the whole block
+    // instead of leaving 124 of 128 threads parked at the barrier while 4
+    // grind through IEEE divides.
+    for (std::size_t i = threadIdx.x; i < window * group; i += blockDim.x)
+        scores[i] /= denom_s[i % group];
     __syncthreads();
 
     if (threadIdx.x < head_dim) {
+        // V was the one tensor still read straight from global inside the
+        // accumulation loop, through the `chain[w]` indirection, one 4-byte
+        // load per iteration with nothing in flight behind it: the loop trip
+        // count is a runtime value so the compiler kept it rolled and every
+        // iteration waited on its own load (long_scoreboard).
+        //
+        // Batch VSTEP rows into registers first, then spend them. The loads
+        // are mutually independent (chain[] already sits in shared memory),
+        // so VSTEP of them are in flight at once. The `value[gi] +=` chain
+        // still runs in ascending w with the same grouping, so the result is
+        // bit-identical.
+        constexpr std::size_t VSTEP = 8;
+        const std::size_t vrow = kv_heads * head_dim;
+        const std::size_t vcol = kh * head_dim + threadIdx.x;
         float value[group] = {};
-        for (std::size_t w = 0; w < window; ++w) {
-            const std::size_t key_row = chain[w];
-            const std::size_t vbase =
-                (key_row * kv_heads + kh) * head_dim;
-            const float vv = v[vbase + threadIdx.x];
+        std::size_t w = 0;
+        for (; w + VSTEP <= window; w += VSTEP) {
+            float vv[VSTEP];
+#pragma unroll
+            for (std::size_t j = 0; j < VSTEP; ++j)
+                vv[j] = v[static_cast<std::size_t>(chain[w + j]) * vrow
+                          + vcol];
+#pragma unroll
+            for (std::size_t j = 0; j < VSTEP; ++j) {
+                const float* ws = scores + (w + j) * group;
+#pragma unroll
+                for (std::size_t gi = 0; gi < group; ++gi)
+                    value[gi] += ws[gi] * vv[j];
+            }
+        }
+        for (; w < window; ++w) {
+            const float vv =
+                v[static_cast<std::size_t>(chain[w]) * vrow + vcol];
             const float* ws = scores + w * group;
 #pragma unroll
             for (std::size_t gi = 0; gi < group; ++gi)
@@ -2874,17 +3008,24 @@ k_matmul_transposed_narrow(
 namespace {
 bool try_matmul_8x8(const float* da, const float* db, const float* dbias,
                     float* dc, std::size_t m, std::size_t k, std::size_t n) {
-    if (n % T8_BN != 0 || k % T8_BK != 0 || m < T8_BM) return false;
+    if (n % 4 != 0 || n < T8_BN || k % T8_BK != 0 || m < T8_BM)
+        return false;
     static const bool t8_carveout = [] {
         prefer_shared_carveout(
-            reinterpret_cast<const void*>(k_matmul_transposed_8x8));
+            reinterpret_cast<const void*>(k_matmul_transposed_8x8<false>));
+        prefer_shared_carveout(
+            reinterpret_cast<const void*>(k_matmul_transposed_8x8<true>));
         return true;
     }();
     (void)t8_carveout;
-    const dim3 grid(static_cast<unsigned>(n / T8_BN),
+    const dim3 grid(static_cast<unsigned>((n + T8_BN - 1) / T8_BN),
                     static_cast<unsigned>((m + T8_BM - 1) / T8_BM));
-    k_matmul_transposed_8x8<<<grid, T8_THREADS>>>(
-        da, db, dbias, dc, m, k, n);
+    if (n % T8_BN == 0)
+        k_matmul_transposed_8x8<false><<<grid, T8_THREADS>>>(
+            da, db, dbias, dc, m, k, n);
+    else
+        k_matmul_transposed_8x8<true><<<grid, T8_THREADS>>>(
+            da, db, dbias, dc, m, k, n);
     check_cuda(cudaGetLastError(), "k_matmul_transposed_8x8 launch");
     return true;
 }
@@ -2922,7 +3063,15 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
                    "k_matmul_transposed_narrow launch");
         return;
     }
-    if (m >= BIG_BM && n >= BIG_BN) {
+    // n >= BIG_BN is enough to route here on its own: the wide/async/
+    // register-blocked kernels below all guard row < m and col < n on
+    // every load and on the writeback, so a small m (e.g. the m~8,
+    // n~32064 LM-head projection) just means most of a BIG_BM row-tile
+    // is idle -- it doesn't touch correctness, and the wide B-matrix
+    // traffic (which dominates DRAM bytes here) is still read once per
+    // N-tile via vectorized/async/swizzled loads instead of the naive
+    // k_matmul_transposed_tiled path's scalar ones.
+    if (n >= BIG_BN) {
         const dim3 block(BIG_BX, BIG_BY);
         const dim3 grid(
             static_cast<unsigned>((n + BIG_BN - 1) / BIG_BN),
