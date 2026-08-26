@@ -1214,15 +1214,21 @@ struct MoeScratch {
     std::uint32_t* route_positions = nullptr;
     std::uint32_t* work_expert = nullptr;
     std::uint32_t* work_start = nullptr;
+    std::uint32_t* work_expert_tall = nullptr;
+    std::uint32_t* work_start_tall = nullptr;
     std::size_t row_capacity = 0;
     std::size_t work_capacity = 0;
+    std::size_t tall_capacity = 0;
 };
 
 MoeScratch& moe_scratch(std::size_t rows) {
     static MoeScratch scratch;
     const std::size_t max_work = (2 * rows + BIG_BM - 1) / BIG_BM +
                                  apss26::NUM_EXPERTS;
-    if (scratch.row_capacity >= rows && scratch.work_capacity >= max_work)
+    const std::size_t max_tall = (2 * rows + T8_BM - 1) / T8_BM +
+                                 apss26::NUM_EXPERTS;
+    if (scratch.row_capacity >= rows && scratch.work_capacity >= max_work &&
+        scratch.tall_capacity >= max_tall)
         return scratch;
     if (scratch.routes) cudaFree(scratch.routes);
     if (scratch.counts) cudaFree(scratch.counts);
@@ -1231,6 +1237,8 @@ MoeScratch& moe_scratch(std::size_t rows) {
     if (scratch.route_positions) cudaFree(scratch.route_positions);
     if (scratch.work_expert) cudaFree(scratch.work_expert);
     if (scratch.work_start) cudaFree(scratch.work_start);
+    if (scratch.work_expert_tall) cudaFree(scratch.work_expert_tall);
+    if (scratch.work_start_tall) cudaFree(scratch.work_start_tall);
     check_cuda(cudaMalloc(&scratch.routes, 2 * rows * sizeof(std::uint8_t)),
                "cudaMalloc MoE routes");
     check_cuda(cudaMalloc(&scratch.counts,
@@ -1252,8 +1260,15 @@ MoeScratch& moe_scratch(std::size_t rows) {
     check_cuda(cudaMalloc(&scratch.work_start,
                           max_work * sizeof(std::uint32_t)),
                "cudaMalloc MoE work starts");
+    check_cuda(cudaMalloc(&scratch.work_expert_tall,
+                          max_tall * sizeof(std::uint32_t)),
+               "cudaMalloc MoE tall work experts");
+    check_cuda(cudaMalloc(&scratch.work_start_tall,
+                          max_tall * sizeof(std::uint32_t)),
+               "cudaMalloc MoE tall work starts");
     scratch.row_capacity = rows;
     scratch.work_capacity = max_work;
+    scratch.tall_capacity = max_tall;
     return scratch;
 }
 
@@ -1297,18 +1312,27 @@ __global__ void k_moe_top2(const float* router, std::uint8_t* routes,
     atomicAdd(counts + second, 1u);
 }
 
+// Two work queues: the 64-row one the older grouped kernels expect and a
+// 128-row one for the 8x8 kernels. A taller row tile is what halves the
+// expert-weight re-reads -- each expert's gate+up slab is re-streamed once
+// per row tile, so 31 tiles per expert become 16.
 __global__ void k_moe_offsets_work(
     const std::uint32_t* counts, std::uint32_t* offsets,
-    std::uint32_t* work_expert, std::uint32_t* work_start) {
+    std::uint32_t* work_expert, std::uint32_t* work_start,
+    std::uint32_t* work_expert_tall, std::uint32_t* work_start_tall) {
     __shared__ std::uint32_t work_offsets[apss26::NUM_EXPERTS + 1];
+    __shared__ std::uint32_t tall_offsets[apss26::NUM_EXPERTS + 1];
     if (threadIdx.x == 0) {
         offsets[0] = 0;
         work_offsets[0] = 0;
+        tall_offsets[0] = 0;
         for (std::size_t expert = 0; expert < apss26::NUM_EXPERTS;
              ++expert) {
             offsets[expert + 1] = offsets[expert] + counts[expert];
             work_offsets[expert + 1] = work_offsets[expert] +
                 (counts[expert] + BIG_BM - 1) / BIG_BM;
+            tall_offsets[expert + 1] = tall_offsets[expert] +
+                (counts[expert] + T8_BM - 1) / T8_BM;
         }
     }
     __syncthreads();
@@ -1320,6 +1344,13 @@ __global__ void k_moe_offsets_work(
             const std::uint32_t wi = work_offsets[e] + chunk;
             work_expert[wi] = e;
             work_start[wi] = offsets[e] + chunk * BIG_BM;
+        }
+        const std::uint32_t tall =
+            (counts[e] + T8_BM - 1) / T8_BM;
+        for (std::uint32_t chunk = 0; chunk < tall; ++chunk) {
+            const std::uint32_t wi = tall_offsets[e] + chunk;
+            work_expert_tall[wi] = e;
+            work_start_tall[wi] = offsets[e] + chunk * T8_BM;
         }
     }
 }
@@ -1686,6 +1717,227 @@ k_moe_matmul_grouped_wide_async(
             const std::size_t row = row0 + r, col = col0 + cc;
             if (row < end && col < n) out[row * n + col] = acc[r][cc];
         }
+}
+
+// Grouped 8x8 GEMM over one expert's row range -- the MoE analogue of
+// k_matmul_transposed_8x8, with the same K-major shared tiles, the same
+// register-prefetch pipeline and the same ascending-K accumulation, so the
+// values it produces are bit-identical to the 64-row kernels.
+__global__ void __launch_bounds__(T8_THREADS, 2)
+k_moe_matmul_8x8(
+    const float* __restrict__ a, const float* __restrict__ const* weights,
+    float* __restrict__ out, const std::uint32_t* __restrict__ offsets,
+    const std::uint32_t* __restrict__ work_expert,
+    const std::uint32_t* __restrict__ work_start, std::size_t max_work,
+    std::size_t k, std::size_t n) {
+    const std::size_t wi = blockIdx.y;
+    if (wi >= max_work) return;
+    const std::uint32_t expert = work_expert[wi];
+    if (expert >= apss26::NUM_EXPERTS) return;
+    const std::size_t block_row = work_start[wi];
+    const std::size_t end = offsets[expert + 1];
+    const float* __restrict__ b = weights[expert];
+
+    __shared__ __align__(16) float As[2][T8_BK][T8_PITCH];
+    __shared__ __align__(16) float Bs[2][T8_BK][T8_PITCH];
+
+    const int tid = threadIdx.x;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * T8_BN;
+    const int ld_row = tid >> 1;
+    const int ld_k = (tid & 1) * 4;
+    const std::size_t a_row = block_row + ld_row;
+    const bool a_live = a_row < end;
+    const float* __restrict__ a_src = a + (a_live ? a_row : 0) * k + ld_k;
+    const float* __restrict__ b_src =
+        b + (block_col + ld_row) * k + ld_k;
+
+    float acc[8][8] = {};
+    float4 pa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 pb;
+    auto load = [&](std::size_t tile) {
+        const std::size_t p0 = tile * T8_BK;
+        if (a_live) pa = *reinterpret_cast<const float4*>(a_src + p0);
+        pb = *reinterpret_cast<const float4*>(b_src + p0);
+    };
+    auto store = [&](int stage) {
+        As[stage][ld_k + 0][ld_row] = pa.x;
+        As[stage][ld_k + 1][ld_row] = pa.y;
+        As[stage][ld_k + 2][ld_row] = pa.z;
+        As[stage][ld_k + 3][ld_row] = pa.w;
+        Bs[stage][ld_k + 0][ld_row] = pb.x;
+        Bs[stage][ld_k + 1][ld_row] = pb.y;
+        Bs[stage][ld_k + 2][ld_row] = pb.z;
+        Bs[stage][ld_k + 3][ld_row] = pb.w;
+    };
+
+    const std::size_t tiles = k / T8_BK;
+    load(0);
+    store(0);
+    if (tiles > 1) load(1);
+    __syncthreads();
+    for (std::size_t t = 0; t < tiles; ++t) {
+        const int stage = static_cast<int>(t & 1);
+        if (t + 1 < tiles) store(stage ^ 1);
+        if (t + 2 < tiles) load(t + 2);
+#pragma unroll
+        for (int p = 0; p < T8_BK; ++p) {
+            const float4 a0 = *reinterpret_cast<const float4*>(
+                &As[stage][p][ty * 4]);
+            const float4 a1 = *reinterpret_cast<const float4*>(
+                &As[stage][p][64 + ty * 4]);
+            const float4 b0 = *reinterpret_cast<const float4*>(
+                &Bs[stage][p][tx * 4]);
+            const float4 b1 = *reinterpret_cast<const float4*>(
+                &Bs[stage][p][64 + tx * 4]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w,
+                                 a1.x, a1.y, a1.z, a1.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w,
+                                 b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+#pragma unroll
+                for (int cc = 0; cc < 8; ++cc)
+                    acc[r][cc] += av[r] * bv[cc];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int lr = r < 4 ? ty * 4 + r : 64 + ty * 4 + (r - 4);
+        const std::size_t row = block_row + lr;
+        if (row >= end) continue;
+        float* __restrict__ crow = out + row * n + block_col;
+        *reinterpret_cast<float4*>(crow + tx * 4) =
+            make_float4(acc[r][0], acc[r][1], acc[r][2], acc[r][3]);
+        *reinterpret_cast<float4*>(crow + 64 + tx * 4) =
+            make_float4(acc[r][4], acc[r][5], acc[r][6], acc[r][7]);
+    }
+}
+
+// Fused gate/up GEMM on a 128 x (64 + 64) tile: eight rows and four columns
+// of each weight per thread, so a K step reads eight A values and two float4
+// of B for 64 FMAs -- the same 1 byte per FLOP the 8x8 projection kernel
+// hits, with the gate and up halves of a column landing in the same thread's
+// registers so SiLU can close over both without a round trip.
+constexpr int T8P_BN = 64;
+constexpr int T8P_PITCH = T8P_BN + 4;
+
+__global__ void __launch_bounds__(T8_THREADS, 2)
+k_moe_pair_silu_8x8(
+    const float* __restrict__ a,
+    const float* __restrict__ const* gate_weights,
+    const float* __restrict__ const* up_weights,
+    float* __restrict__ out, const std::uint32_t* __restrict__ offsets,
+    const std::uint32_t* __restrict__ work_expert,
+    const std::uint32_t* __restrict__ work_start, std::size_t max_work,
+    std::size_t k, std::size_t n) {
+    const std::size_t wi = blockIdx.y;
+    if (wi >= max_work) return;
+    const std::uint32_t expert = work_expert[wi];
+    if (expert >= apss26::NUM_EXPERTS) return;
+    const std::size_t block_row = work_start[wi];
+    const std::size_t end = offsets[expert + 1];
+
+    __shared__ __align__(16) float As[2][T8_BK][T8_PITCH];
+    __shared__ __align__(16) float Bg[2][T8_BK][T8P_PITCH];
+    __shared__ __align__(16) float Bu[2][T8_BK][T8P_PITCH];
+
+    const int tid = threadIdx.x;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const std::size_t block_col =
+        static_cast<std::size_t>(blockIdx.x) * T8P_BN;
+    const int ld_row = tid >> 1;
+    const int ld_k = (tid & 1) * 4;
+    const std::size_t a_row = block_row + ld_row;
+    const bool a_live = a_row < end;
+    const float* __restrict__ a_src = a + (a_live ? a_row : 0) * k + ld_k;
+
+    // Half the block stages gate, half stages up; the split is on bit 7 of
+    // the thread id, so it falls on a warp boundary and costs no divergence.
+    const int is_up = tid >> 7;
+    const int b_row = (tid & 127) >> 1;
+    const int b_k = (tid & 1) * 4;
+    const float* __restrict__ b_src =
+        (is_up ? up_weights[expert] : gate_weights[expert]) +
+        (block_col + b_row) * k + b_k;
+
+    float gate_acc[8][4] = {};
+    float up_acc[8][4] = {};
+    float4 pa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 pb;
+    auto load = [&](std::size_t tile) {
+        const std::size_t p0 = tile * T8_BK;
+        if (a_live) pa = *reinterpret_cast<const float4*>(a_src + p0);
+        pb = *reinterpret_cast<const float4*>(b_src + p0);
+    };
+    auto store = [&](int stage) {
+        As[stage][ld_k + 0][ld_row] = pa.x;
+        As[stage][ld_k + 1][ld_row] = pa.y;
+        As[stage][ld_k + 2][ld_row] = pa.z;
+        As[stage][ld_k + 3][ld_row] = pa.w;
+        if (is_up) {
+            Bu[stage][b_k + 0][b_row] = pb.x;
+            Bu[stage][b_k + 1][b_row] = pb.y;
+            Bu[stage][b_k + 2][b_row] = pb.z;
+            Bu[stage][b_k + 3][b_row] = pb.w;
+        } else {
+            Bg[stage][b_k + 0][b_row] = pb.x;
+            Bg[stage][b_k + 1][b_row] = pb.y;
+            Bg[stage][b_k + 2][b_row] = pb.z;
+            Bg[stage][b_k + 3][b_row] = pb.w;
+        }
+    };
+
+    const std::size_t tiles = k / T8_BK;
+    load(0);
+    store(0);
+    if (tiles > 1) load(1);
+    __syncthreads();
+    for (std::size_t t = 0; t < tiles; ++t) {
+        const int stage = static_cast<int>(t & 1);
+        if (t + 1 < tiles) store(stage ^ 1);
+        if (t + 2 < tiles) load(t + 2);
+#pragma unroll
+        for (int p = 0; p < T8_BK; ++p) {
+            const float4 a0 = *reinterpret_cast<const float4*>(
+                &As[stage][p][ty * 4]);
+            const float4 a1 = *reinterpret_cast<const float4*>(
+                &As[stage][p][64 + ty * 4]);
+            const float4 bg = *reinterpret_cast<const float4*>(
+                &Bg[stage][p][tx * 4]);
+            const float4 bu = *reinterpret_cast<const float4*>(
+                &Bu[stage][p][tx * 4]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w,
+                                 a1.x, a1.y, a1.z, a1.w};
+            const float gv[4] = {bg.x, bg.y, bg.z, bg.w};
+            const float uv[4] = {bu.x, bu.y, bu.z, bu.w};
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) {
+                    gate_acc[r][cc] += av[r] * gv[cc];
+                    up_acc[r][cc] += av[r] * uv[cc];
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int lr = r < 4 ? ty * 4 + r : 64 + ty * 4 + (r - 4);
+        const std::size_t row = block_row + lr;
+        if (row >= end) continue;
+        float* __restrict__ crow = out + row * n + block_col + tx * 4;
+#pragma unroll
+        for (int cc = 0; cc < 4; ++cc) {
+            const float x = gate_acc[r][cc];
+            crow[cc] = x / (1.0f + static_cast<float>(
+                exp(static_cast<double>(-x)))) * up_acc[r][cc];
+        }
+    }
 }
 
 __global__ void k_moe_combine(
@@ -2185,18 +2437,34 @@ __global__ void k_attention_tree_gqa4(
         __syncthreads();
     }
 
+    // The softmax used to run entirely on `group` threads -- 4 of 128 -- and
+    // the expensive part of it is the exponential, which the reference path
+    // evaluates in double. GA102 runs FP64 at 1/64 rate, and a warp-wide
+    // DFMA occupies that pipe for the same ~16 cycles whether 4 lanes are
+    // live or 32, so those 4 threads were paying full warp price per key.
+    //
+    // exp is a pure function of a single score, so which thread evaluates it
+    // cannot change the value. Spread the window x group exponentials over
+    // the whole block and leave on one thread only what has an order to
+    // preserve: the running denominator sum in ascending w.
+    __shared__ float maxv_s[group];
     if (threadIdx.x < group) {
         const std::size_t gi = threadIdx.x;
         float maxv = -3.402823466e+38F;
         for (std::size_t w = 0; w < window; ++w)
             maxv = fmaxf(maxv, scores[w * group + gi]);
+        maxv_s[gi] = maxv;
+    }
+    __syncthreads();
+    for (std::size_t i = threadIdx.x; i < window * group; i += blockDim.x)
+        scores[i] = static_cast<float>(
+            exp(static_cast<double>(scores[i] - maxv_s[i % group])));
+    __syncthreads();
+    if (threadIdx.x < group) {
+        const std::size_t gi = threadIdx.x;
         float denom = 0.0f;
-        for (std::size_t w = 0; w < window; ++w) {
-            const float e = static_cast<float>(
-                exp(static_cast<double>(scores[w * group + gi] - maxv)));
-            scores[w * group + gi] = e;
-            denom += e;
-        }
+        for (std::size_t w = 0; w < window; ++w)
+            denom += scores[w * group + gi];
         for (std::size_t w = 0; w < window; ++w)
             scores[w * group + gi] /= denom;
     }
@@ -2390,9 +2658,14 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
     const std::size_t assignments = 2 * rows;
     const std::size_t max_work =
         (assignments + BIG_BM - 1) / BIG_BM + apss26::NUM_EXPERTS;
+    const std::size_t max_tall =
+        (assignments + T8_BM - 1) / T8_BM + apss26::NUM_EXPERTS;
     check_cuda(cudaMemsetAsync(scratch.work_expert, 0xff,
                                max_work * sizeof(std::uint32_t), 0),
                "clear MoE work queue");
+    check_cuda(cudaMemsetAsync(scratch.work_expert_tall, 0xff,
+                               max_tall * sizeof(std::uint32_t), 0),
+               "clear MoE tall work queue");
     check_cuda(cudaMemsetAsync(scratch.counts, 0,
                                apss26::NUM_EXPERTS * sizeof(std::uint32_t), 0),
                "clear MoE counts");
@@ -2400,7 +2673,8 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
         router.cuda_data(), scratch.routes, scratch.counts, rows);
     k_moe_offsets_work<<<1, 32>>>(
         scratch.counts, scratch.offsets,
-        scratch.work_expert, scratch.work_start);
+        scratch.work_expert, scratch.work_start,
+        scratch.work_expert_tall, scratch.work_start_tall);
     k_moe_fill_stable<<<apss26::NUM_EXPERTS, 256>>>(
         scratch.routes, scratch.offsets, scratch.assignment_rows,
         scratch.route_positions, rows);
@@ -2416,6 +2690,24 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
     const MoeWeightSet& weights =
         moe_weight_registry()[weights_handle - 1];
     const dim3 block(BIG_BX, BIG_BY);
+    if (apss26::EXPERT_INTERMEDIATE_SIZE % T8P_BN == 0 &&
+        h % T8_BK == 0) {
+        static const bool pair8_carveout = [] {
+            prefer_shared_carveout(
+                reinterpret_cast<const void*>(k_moe_pair_silu_8x8));
+            return true;
+        }();
+        (void)pair8_carveout;
+        const dim3 pair8_grid(
+            static_cast<unsigned>(apss26::EXPERT_INTERMEDIATE_SIZE / T8P_BN),
+            static_cast<unsigned>(max_tall));
+        k_moe_pair_silu_8x8<<<pair8_grid, T8_THREADS>>>(
+            compact_input.cuda_data(), weights.w1, weights.w3,
+            activated.cuda_data_write(), scratch.offsets,
+            scratch.work_expert_tall, scratch.work_start_tall, max_tall,
+            h, apss26::EXPERT_INTERMEDIATE_SIZE);
+        check_cuda(cudaGetLastError(), "k_moe_pair_silu_8x8 launch");
+    } else {
     const dim3 pair_grid(
         static_cast<unsigned>((apss26::EXPERT_INTERMEDIATE_SIZE +
                                BIG_BN - 1) / BIG_BN),
@@ -2425,12 +2717,29 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
         activated.cuda_data_write(), scratch.offsets,
         scratch.work_expert, scratch.work_start, max_work,
         h, apss26::EXPERT_INTERMEDIATE_SIZE);
+    }
 
     Tensor expert_output({assignments, h});
     const dim3 out_grid(
         static_cast<unsigned>((h + BIG_BN - 1) / BIG_BN),
         static_cast<unsigned>(max_work));
-    if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0 && h % WIDE_BN == 0) {
+    if (h % T8_BN == 0 && apss26::EXPERT_INTERMEDIATE_SIZE % T8_BK == 0) {
+        static const bool moe8_carveout = [] {
+            prefer_shared_carveout(
+                reinterpret_cast<const void*>(k_moe_matmul_8x8));
+            return true;
+        }();
+        (void)moe8_carveout;
+        const dim3 grid8(static_cast<unsigned>(h / T8_BN),
+                         static_cast<unsigned>(max_tall));
+        k_moe_matmul_8x8<<<grid8, T8_THREADS>>>(
+            activated.cuda_data(), weights.w2,
+            expert_output.cuda_data_write(), scratch.offsets,
+            scratch.work_expert_tall, scratch.work_start_tall, max_tall,
+            apss26::EXPERT_INTERMEDIATE_SIZE, h);
+        check_cuda(cudaGetLastError(), "k_moe_matmul_8x8 launch");
+    } else if (apss26::EXPERT_INTERMEDIATE_SIZE % BIG_BK == 0 &&
+               h % WIDE_BN == 0) {
         static const bool wide_carveout = [] {
             prefer_shared_carveout(reinterpret_cast<const void*>(
                 k_moe_matmul_grouped_wide_async));
