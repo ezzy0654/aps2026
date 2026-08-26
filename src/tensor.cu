@@ -2793,6 +2793,84 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
     check_cuda(cudaGetLastError(), "grouped MoE kernels launch");
 }
 
+// The MoE router GEMM has N = NUM_EXPERTS = 16. The generic tiled kernel
+// gives each thread one output, reads two shared floats per FMA, and walks K
+// in 16-deep tiles -- 256 barriers per block -- which leaves it at roughly
+// half the memory roof while streaming the whole 255 MB activation matrix.
+// Block 64 rows against all 16 columns instead: four rows per thread off one
+// float4 shared read, a 32-deep K tile, and a weight matrix small enough
+// (256 KB) to stay hot in L2 for the entire launch. K is still walked in
+// ascending order into one accumulator per output.
+constexpr int NR_BM = 64;
+constexpr int NR_BK = 32;
+constexpr int NR_MAXN = 32;
+constexpr int NR_THREADS = 256;
+
+__global__ void __launch_bounds__(NR_THREADS)
+k_matmul_transposed_narrow(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ c,
+    std::size_t m, std::size_t k, std::size_t n) {
+    __shared__ __align__(16) float As[NR_BK][NR_BM + 4];
+    __shared__ __align__(16) float Bs[NR_BK][NR_MAXN];
+
+    const int tid = threadIdx.x;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const std::size_t block_row =
+        static_cast<std::size_t>(blockIdx.x) * NR_BM;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const std::size_t tiles = k / NR_BK;
+    for (std::size_t t = 0; t < tiles; ++t) {
+        const std::size_t p0 = t * NR_BK;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = tid + i * NR_THREADS;
+            const int lr = v >> 3;
+            const int kc = (v & 7) * 4;
+            const std::size_t row = block_row + lr;
+            float4 val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (row < m)
+                val = *reinterpret_cast<const float4*>(
+                    a + row * k + p0 + kc);
+            As[kc + 0][lr] = val.x;
+            As[kc + 1][lr] = val.y;
+            As[kc + 2][lr] = val.z;
+            As[kc + 3][lr] = val.w;
+        }
+        if (tid < static_cast<int>(n) * (NR_BK / 4)) {
+            const int col = tid >> 3;
+            const int kc = (tid & 7) * 4;
+            const float4 val = *reinterpret_cast<const float4*>(
+                b + static_cast<std::size_t>(col) * k + p0 + kc);
+            Bs[kc + 0][col] = val.x;
+            Bs[kc + 1][col] = val.y;
+            Bs[kc + 2][col] = val.z;
+            Bs[kc + 3][col] = val.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < NR_BK; ++p) {
+            const float bv = Bs[p][tx];
+            const float4 av =
+                *reinterpret_cast<const float4*>(&As[p][ty * 4]);
+            acc[0] += av.x * bv;
+            acc[1] += av.y * bv;
+            acc[2] += av.z * bv;
+            acc[3] += av.w * bv;
+        }
+        __syncthreads();
+    }
+    if (tx < static_cast<int>(n)) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const std::size_t row = block_row + ty * 4 + r;
+            if (row < m) c[row * n + tx] = acc[r];
+        }
+    }
+}
+
 namespace {
 bool try_matmul_8x8(const float* da, const float* db, const float* dbias,
                     float* dc, std::size_t m, std::size_t k, std::size_t n) {
@@ -2836,6 +2914,14 @@ void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c) {
 #endif
     const float* db = b.cuda_data();
     if (try_matmul_8x8(da, db, nullptr, dc, m, k, n)) return;
+    if (n <= NR_MAXN && n % 4 == 0 && k % NR_BK == 0 && m >= NR_BM) {
+        k_matmul_transposed_narrow<<<
+            static_cast<unsigned>((m + NR_BM - 1) / NR_BM),
+            NR_THREADS>>>(da, db, dc, m, k, n);
+        check_cuda(cudaGetLastError(),
+                   "k_matmul_transposed_narrow launch");
+        return;
+    }
     if (m >= BIG_BM && n >= BIG_BN) {
         const dim3 block(BIG_BX, BIG_BY);
         const dim3 grid(
