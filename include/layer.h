@@ -77,6 +77,14 @@ private:
 class PhiDecoderLayer {
 public:
     PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_idx);
+    // Residual-carrying form used by the packed GPU path. On entry the layer
+    // input is `x` when `has_carry` is false and `x + carry` otherwise; on
+    // exit `x` holds the MoE output and `carry` the attention residual, so
+    // the pending add rides into the next LayerNorm instead of costing its
+    // own pass over the residual stream.
+    void forward_carry(Tensor& x, Tensor& carry, bool has_carry,
+                       const std::vector<std::size_t>& seq_lens,
+                       const PrefixExpansion& expansion) const;
     void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false,
                  const PrefixExpansion& expansion = {}) const;
 private:

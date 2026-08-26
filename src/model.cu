@@ -135,11 +135,18 @@ void PhiTinyMoEModel::generate(
     expansion.anc_stride = max_len;
     expansion.max_seq = max_len;
 
-    for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true, expansion); hidden = std::move(next); }
+    Tensor carry;
+    bool has_carry = false;
+    for (const auto& layer : layers_) {
+        layer.forward_carry(hidden, carry, has_carry, seq_lens, expansion);
+        has_carry = true;
+    }
 
+    // The last layer's pending residual add folds into the final LayerNorm
+    // the same way it folds into every other one.
     Tensor normed(hidden.shape());
-    tensor_ops::layer_norm_gpu(
-        hidden, final_norm_weight_, final_norm_bias_,
+    tensor_ops::add_layer_norm_gpu(
+        hidden, carry, final_norm_weight_, final_norm_bias_,
         apss26::NORM_EPS, normed);
 
     Tensor last({batch, apss26::HIDDEN_SIZE});

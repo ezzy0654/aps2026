@@ -270,6 +270,35 @@ PhiDecoderLayer::PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_id
       post_norm_bias_(loader.load("model.layers." + std::to_string(layer_idx) + ".post_attention_layernorm.bias")),
       attention_(loader, layer_idx), moe_(loader, layer_idx) {}
 
+void PhiDecoderLayer::forward_carry(
+    Tensor& x, Tensor& carry, bool has_carry,
+    const std::vector<std::size_t>& seq_lens,
+    const PrefixExpansion& expansion) const {
+    Tensor normed(x.shape());
+    if (has_carry) {
+        // x += carry is exactly the add the previous layer used to run as its
+        // own kernel; folding it into this LayerNorm's staging pass keeps the
+        // per-element order identical and drops a read-modify-write over the
+        // whole residual stream.
+        tensor_ops::add_layer_norm_gpu(
+            x, carry, input_norm_weight_, input_norm_bias_,
+            apss26::NORM_EPS, normed);
+    } else {
+        tensor_ops::layer_norm_gpu(
+            x, input_norm_weight_, input_norm_bias_,
+            apss26::NORM_EPS, normed);
+    }
+    Tensor attn;
+    attention_.forward(normed, attn, seq_lens, /*use_gpu=*/true, expansion);
+    Tensor post(attn.shape()), ff;
+    tensor_ops::add_layer_norm_gpu(
+        attn, x, post_norm_weight_, post_norm_bias_,
+        apss26::NORM_EPS, post);
+    moe_.forward(post, ff, /*use_gpu=*/true);
+    x = std::move(ff);
+    carry = std::move(attn);
+}
+
 void PhiDecoderLayer::forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu,
                               const PrefixExpansion& expansion) const {
     Tensor normed(x.shape()), attn;

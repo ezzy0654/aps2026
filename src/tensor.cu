@@ -1828,6 +1828,7 @@ constexpr int T8P_PITCH = T8P_BN + 4;
 __global__ void __launch_bounds__(T8_THREADS, 2)
 k_moe_pair_silu_8x8(
     const float* __restrict__ a,
+    const std::uint32_t* __restrict__ assignment_rows,
     const float* __restrict__ const* gate_weights,
     const float* __restrict__ const* up_weights,
     float* __restrict__ out, const std::uint32_t* __restrict__ offsets,
@@ -1852,9 +1853,15 @@ k_moe_pair_silu_8x8(
         static_cast<std::size_t>(blockIdx.x) * T8P_BN;
     const int ld_row = tid >> 1;
     const int ld_k = (tid & 1) * 4;
-    const std::size_t a_row = block_row + ld_row;
-    const bool a_live = a_row < end;
-    const float* __restrict__ a_src = a + (a_live ? a_row : 0) * k + ld_k;
+    // The A row this thread stages is looked up once: the gather that used
+    // to materialize a compacted [2*rows, 4096] copy of the residual stream
+    // is folded in here as an index on the load. It was a 511 MB write and a
+    // 511 MB read of a tensor this kernel is the only consumer of.
+    const std::size_t a_slot = block_row + ld_row;
+    const bool a_live = a_slot < end;
+    const std::size_t a_row =
+        a_live ? static_cast<std::size_t>(assignment_rows[a_slot]) : 0;
+    const float* __restrict__ a_src = a + a_row * k + ld_k;
 
     // Half the block stages gate, half stages up; the split is on bit 7 of
     // the thread id, so it falls on a warp boundary and costs no divergence.
@@ -2680,18 +2687,22 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
         scratch.route_positions, rows);
     check_cuda(cudaGetLastError(), "MoE routing kernels launch");
 
-    Tensor compact_input({assignments, h});
-    const std::size_t input_elems = assignments * h;
-    k_moe_gather_compact<<<(input_elems + 255) / 256, 256>>>(
-        x.cuda_data(), scratch.assignment_rows,
-        compact_input.cuda_data_write(), assignments, h);
+    const bool fused_gather =
+        apss26::EXPERT_INTERMEDIATE_SIZE % T8P_BN == 0 && h % T8_BK == 0;
+    Tensor compact_input;
+    if (!fused_gather) {
+        compact_input = Tensor({assignments, h});
+        const std::size_t input_elems = assignments * h;
+        k_moe_gather_compact<<<(input_elems + 255) / 256, 256>>>(
+            x.cuda_data(), scratch.assignment_rows,
+            compact_input.cuda_data_write(), assignments, h);
+    }
 
     Tensor activated({assignments, apss26::EXPERT_INTERMEDIATE_SIZE});
     const MoeWeightSet& weights =
         moe_weight_registry()[weights_handle - 1];
     const dim3 block(BIG_BX, BIG_BY);
-    if (apss26::EXPERT_INTERMEDIATE_SIZE % T8P_BN == 0 &&
-        h % T8_BK == 0) {
+    if (fused_gather) {
         static const bool pair8_carveout = [] {
             prefer_shared_carveout(
                 reinterpret_cast<const void*>(k_moe_pair_silu_8x8));
@@ -2702,7 +2713,7 @@ void moe_forward_grouped_gpu(const Tensor& x, const Tensor& router,
             static_cast<unsigned>(apss26::EXPERT_INTERMEDIATE_SIZE / T8P_BN),
             static_cast<unsigned>(max_tall));
         k_moe_pair_silu_8x8<<<pair8_grid, T8_THREADS>>>(
-            compact_input.cuda_data(), weights.w1, weights.w3,
+            x.cuda_data(), scratch.assignment_rows, weights.w1, weights.w3,
             activated.cuda_data_write(), scratch.offsets,
             scratch.work_expert_tall, scratch.work_start_tall, max_tall,
             h, apss26::EXPERT_INTERMEDIATE_SIZE);
