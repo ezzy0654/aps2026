@@ -279,8 +279,8 @@ constexpr int kPad = 4;
 // VEC vectorises both the global load and the shared read into float4. It
 // needs K % 4 == 0 and 16B-aligned A/B, so launch_matmul checks and falls
 // back to the scalar path otherwise; the two produce identical results.
-template <int BM, int BN, int TM, int TN, bool VEC, int NT = kThreads>
-__global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const float* __restrict__ A,
+template <int BM, int BN, int TM, int TN, bool VEC, int NT = kThreads, int MINB = 2>
+__global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(const float* __restrict__ A,
                                                  const float* __restrict__ B,
                                                  float* __restrict__ C,
                                                  int M, int K, int N,
@@ -400,7 +400,16 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
-                    for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];
+                    for (int jj = 0; jj < TN; ++jj) {
+                        // Serpentine: alternating rows walk b backwards so the
+                        // operand-reuse cache keeps a[i]/b[j] alive across the
+                        // row boundary instead of breaking at every one. Only
+                        // the order in which *independent* accumulators are
+                        // touched within one p changes; every acc[i][j] keeps
+                        // its own ascending-p chain, so this is bit-identical.
+                        const int j = (i & 1) ? (TN - 1 - jj) : jj;
+                        acc[i][j] += a[i] * b[j];
+                    }
             }
             // The buffer written here was last read one iteration ago, before
             // that iteration's barrier, so no thread is still in it.
@@ -441,7 +450,16 @@ __global__ __launch_bounds__(NT, 2) void matmul_transposed_blocked_kernel(const 
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
-                    for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];
+                    for (int jj = 0; jj < TN; ++jj) {
+                        // Serpentine: alternating rows walk b backwards so the
+                        // operand-reuse cache keeps a[i]/b[j] alive across the
+                        // row boundary instead of breaking at every one. Only
+                        // the order in which *independent* accumulators are
+                        // touched within one p changes; every acc[i][j] keeps
+                        // its own ascending-p chain, so this is bit-identical.
+                        const int j = (i & 1) ? (TN - 1 - jj) : jj;
+                        acc[i][j] += a[i] * b[j];
+                    }
             }
             __syncthreads();
         }
@@ -1191,20 +1209,40 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
         matmul_transposed_kernel<<<grid, block>>>(
             d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), d_bias);
     } else if (blocks_for(128, 128) >= 2 * kSMs) {
-        // Measured 2026-08-25: a rectangular 128x256 or 256x128 tile (512
-        // threads) keeps registers at 119 and threads/SM at 512 while raising
-        // arithmetic intensity 32 -> 42.7, past the 38 flop/byte where this GPU
-        // turns compute-bound, and it does cut traffic 1.34x as predicted. It
-        // still lost by ~7%: one 512-thread block per SM means a
-        // __syncthreads() stalls all 16 warps, where two 256-thread blocks
-        // cover for each other. Achieved bandwidth fell 692 -> 489 GB/s, more
-        // than the traffic saving. Tile geometry is therefore settled.
-        const dim3 block(128 / 8, 128 / 8);          // 16x16 = 256
+        // The *tile* is settled at 128x128: 128x256 and 256x128 (512 threads)
+        // raise arithmetic intensity 32 -> 42.7, past the 38 flop/byte where
+        // this GPU turns compute-bound, and do cut traffic 1.34x as predicted,
+        // and still lost ~7% -- one 512-thread block per SM means a
+        // __syncthreads() stalls all 16 warps where two blocks would cover for
+        // each other (bandwidth fell 692 -> 489 GB/s).
+        //
+        // The *micro-tile* was not settled, and 8x8 was the wrong choice.
+        // NT is derived: NT = BM*BN/(TM*TN), so every earlier attempt to move
+        // it moved the tile instead, and 16x8 was never tried. It matters
+        // because 8x8 sits exactly on the sm_86 shared/FFMA wall -- per k step
+        // 4 LDS.128 is 2048 B / 128 B-per-clk = 16 clk against 64 FFMA / 4 =
+        // 16 clk, 1:1 with no slack. At 16x8 it is 6 LDS.128 (24 clk) against
+        // 128 FFMA (32 clk): 1:1.33, and the wall moves. Shared floats per
+        // FFMA go 4.0 -> 5.33.
+        //
+        // The price is occupancy: NT drops to 128, so 8 warps/SM = 16.7%,
+        // half of what already looked low. Measured 2026-08-26 anyway:
+        // +7.9% end-to-end, bit-identical. This is the third and strongest
+        // confirmation that occupancy is the wrong knob for this kernel --
+        // forcing it *up* to 50% costs 20% (see kernels.md).
+        //
+        // MINB must be 1 here. At 248 registers a hint of 2 makes ptxas cut
+        // registers and spill; left free it allocates 248 and 248*128 = 31744
+        // still fits two blocks in the 32768-register half-SM anyway. That
+        // leaves only 8 registers/thread of headroom -- if a compiler update
+        // pushes past it the SM drops to 1 block and the kernel halves. Check
+        // `nvcc -Xptxas=-v | grep Li128ELi128ELi16ELi8` after touching this.
+        const dim3 block(128 / 8, 128 / 16);         // 16x8 = 128
         const dim3 grid(static_cast<unsigned>((n + 127) / 128),
                         static_cast<unsigned>((m + 127) / 128));
-        if (vec) matmul_transposed_blocked_kernel<128, 128, 8, 8, true><<<grid, block>>>(
+        if (vec) matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1><<<grid, block>>>(
                      d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
-        else     matmul_transposed_blocked_kernel<128, 128, 8, 8, false><<<grid, block>>>(
+        else     matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1><<<grid, block>>>(
                      d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
     } else {
         // Too few blocks at 128x128 (the MoE experts land here): a smaller
@@ -1237,11 +1275,11 @@ void launch_matmul_grouped(const float* d_a, const float* d_b, float* d_c,
     const int ki = static_cast<int>(k), ni = static_cast<int>(n);
     const long long stride = static_cast<long long>(weight_stride);
     if (block_m == 128) {
-        const dim3 block(128 / 8, 128 / 8);
+        const dim3 block(128 / 8, 128 / 16);
         const dim3 grid(static_cast<unsigned>((n + 127) / 128), static_cast<unsigned>(num_tiles));
-        if (vec) matmul_transposed_blocked_kernel<128, 128, 8, 8, true><<<grid, block>>>(
+        if (vec) matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1><<<grid, block>>>(
                      d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
-        else     matmul_transposed_blocked_kernel<128, 128, 8, 8, false><<<grid, block>>>(
+        else     matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1><<<grid, block>>>(
                      d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
     } else {
         const dim3 block(64 / 4, 64 / 4);
