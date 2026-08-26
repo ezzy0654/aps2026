@@ -610,6 +610,26 @@ __global__ void silu_kernel(const float* x, float* y, std::size_t n) {
     }
 }
 
+// Fused silu(gate)*up epilogue for a w1||w3-concatenated grouped GEMM: gateup
+// is [rows, 2*inter], row r's w1 half at [0,inter) and w3 half at
+// [inter,2*inter). Same silu formula as silu_kernel above (exp in double),
+// so bit-identical to running silu_kernel then mul_kernel as two passes --
+// only the number of reads/writes of the 896-wide row changes.
+__global__ void silu_mul_fused_kernel(const float* __restrict__ gateup,
+                                      float* __restrict__ out,
+                                      std::size_t rows, int inter) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = rows * static_cast<std::size_t>(inter);
+    if (idx >= total) return;
+    const std::size_t r = idx / static_cast<std::size_t>(inter);
+    const int j = static_cast<int>(idx - r * static_cast<std::size_t>(inter));
+    const std::size_t base = r * static_cast<std::size_t>(2 * inter);
+    const float g = gateup[base + static_cast<std::size_t>(j)];
+    const float u = gateup[base + static_cast<std::size_t>(inter + j)];
+    const float e = static_cast<float>(exp(static_cast<double>(-g)));
+    out[idx] = (g / (1.0f + e)) * u;
+}
+
 // Mean/variance accumulate in double: this output feeds the MoE gate, whose
 // scores the router snaps onto a 1e-3 grid, so error here can tip a token
 // onto a different expert than the reference chose. layer_norm is a small
@@ -1668,6 +1688,15 @@ void mul(const float* d_a, const float* d_b, float* d_c, std::size_t n) {
     const int blocks = static_cast<int>((n + threads - 1) / threads);
     mul_kernel<<<blocks, threads>>>(d_a, d_b, d_c, n);
     cuda_check(cudaGetLastError(), "device::mul kernel");
+}
+
+void silu_mul_fused(const float* d_gateup, float* d_out, std::size_t rows, std::size_t inter) {
+    const std::size_t total = rows * inter;
+    if (total == 0) return;
+    const int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    silu_mul_fused_kernel<<<blocks, threads>>>(d_gateup, d_out, rows, static_cast<int>(inter));
+    cuda_check(cudaGetLastError(), "device::silu_mul_fused kernel");
 }
 
 void gather_rows(const float* d_src, float* d_dst, const int* d_indices,

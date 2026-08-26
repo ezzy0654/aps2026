@@ -215,6 +215,11 @@ void matmul_transposed_grouped(const float* d_a, const Tensor& weights,
 void matmul_transposed_uncompensated(const float* d_a, const Tensor& weight, float* d_c, std::size_t m);
 void silu(const float* d_x, float* d_y, std::size_t n);
 void mul(const float* d_a, const float* d_b, float* d_c, std::size_t n);
+// Fused epilogue for a w1||w3-concatenated grouped GEMM (see PhiMoE in
+// layer.h): gateup is [rows, 2*inter], each row's w1 half followed by its
+// w3 half. out[r,j] = silu(gateup[r,j]) * gateup[r,inter+j] -- the same
+// formula silu()+mul() compute in two passes, done here in one.
+void silu_mul_fused(const float* d_gateup, float* d_out, std::size_t rows, std::size_t inter);
 void gather_rows(const float* d_src, float* d_dst, const int* d_indices,
                  std::size_t num_rows, std::size_t row_width);
 void scatter_add_rows(float* d_dst, const float* d_src, const int* d_indices,

@@ -50,11 +50,19 @@ private:
     Tensor gate_;
     // All 16 experts' weights concatenated along their row axis, so the
     // expert FFNs run as one grouped launch each instead of 16 serialised
-    // ones: w1_all_/w3_all_ are [16*448, 4096] and w2_all_ is [16*4096, 448],
-    // expert e occupying rows [e*N, (e+1)*N). Concatenation happens at
-    // construction, before the timer starts -- a weight-layout change, which
-    // is the allowed kind. See tensor.h's matmul_transposed_grouped.
-    Tensor w1_all_, w3_all_, w2_all_;
+    // ones: w2_all_ is [16*4096, 448], expert e occupying rows
+    // [e*4096, (e+1)*4096). Concatenation happens at construction, before
+    // the timer starts -- a weight-layout change, which is the allowed
+    // kind. See tensor.h's matmul_transposed_grouped.
+    //
+    // w1 and w3 (each expert's gate/up projection, both [448, 4096]) are
+    // additionally concatenated ALONG N into w13_all_, [16*896, 4096] --
+    // expert e's rows [e*896, e*896+448) are w1, [e*896+448, (e+1)*896) are
+    // w3. 448+448 = 896 = 7*128 exactly, where 448 alone pads to 512 in the
+    // GEMM's 128-wide tile (12.5% wasted columns); one 896-wide grouped
+    // launch also replaces two, and its epilogue feeds directly into
+    // device::silu_mul_fused instead of separate silu/mul kernels.
+    Tensor w13_all_, w2_all_;
     // Reads this token's NUM_EXPERTS gate scores, writes its top-2 picks.
     void route(const float* logits, std::pair<int, float> routes[2]) const;
 };

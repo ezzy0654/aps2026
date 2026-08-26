@@ -105,28 +105,33 @@ PhiMoE::PhiMoE(const ModelLoader& loader, std::size_t layer_idx) {
     // [e*N, (e+1)*N). Same bytes, same values -- only the layout changes, and
     // it happens before the timer starts. What it buys is that all 16 expert
     // FFNs become a single grouped launch (see forward_device below).
+    //
+    // w1 and w3 are additionally concatenated along N (see layer.h): expert
+    // e's block of w13_all_ holds its w1 rows [e*896, e*896+448) then its w3
+    // rows [e*896+448, (e+1)*896).
     const std::string first = base + ".experts.0";
     const Tensor w1_0 = loader.load(first + ".w1.weight");
     const Tensor w2_0 = loader.load(first + ".w2.weight");
     const Tensor w3_0 = loader.load(first + ".w3.weight");
     const std::size_t inter = w1_0.size(0), hidden = w1_0.size(1);
     const std::size_t E = apss26::NUM_EXPERTS;
-    w1_all_ = Tensor({E * inter, hidden});
-    w3_all_ = Tensor({E * inter, hidden});
+    w13_all_ = Tensor({E * 2 * inter, hidden});
     w2_all_ = Tensor({E * hidden, inter});
 
-    const auto stack = [](Tensor& dst, const Tensor& src, std::size_t e) {
-        std::memcpy(dst.data() + e * src.size(), src.data(), src.size() * sizeof(float));
+    const auto stack_rows = [](Tensor& dst, const Tensor& src, std::size_t row_offset, std::size_t row_width) {
+        std::memcpy(dst.data() + row_offset * row_width, src.data(), src.size() * sizeof(float));
     };
     for (std::size_t e = 0; e < E; ++e) {
         const std::string prefix = base + ".experts." + std::to_string(e);
-        stack(w1_all_, e == 0 ? w1_0 : loader.load(prefix + ".w1.weight"), e);
-        stack(w2_all_, e == 0 ? w2_0 : loader.load(prefix + ".w2.weight"), e);
-        stack(w3_all_, e == 0 ? w3_0 : loader.load(prefix + ".w3.weight"), e);
+        const Tensor w1_e = (e == 0) ? w1_0 : loader.load(prefix + ".w1.weight");
+        const Tensor w2_e = (e == 0) ? w2_0 : loader.load(prefix + ".w2.weight");
+        const Tensor w3_e = (e == 0) ? w3_0 : loader.load(prefix + ".w3.weight");
+        stack_rows(w13_all_, w1_e, e * 2 * inter, hidden);
+        stack_rows(w13_all_, w3_e, e * 2 * inter + inter, hidden);
+        stack_rows(w2_all_, w2_e, e * hidden, inter);
     }
-    w1_all_.to_device();
+    w13_all_.to_device();
     w2_all_.to_device();
-    w3_all_.to_device();
 }
 
 // Tile height for the three expert GEMMs. 64 was measured first (it is what
@@ -142,7 +147,7 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     APS_PROFILE_SCOPE("moe.forward");
     namespace device = tensor_ops::device;
     const std::size_t E = apss26::NUM_EXPERTS;
-    const std::size_t inter = w1_all_.size(0) / E;
+    const std::size_t inter = w13_all_.size(0) / (2 * E);
 
     // The hidden state is already device-resident; it is both the gate
     // matmul's input and every expert's gather source.
@@ -232,8 +237,8 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
 
     float* d_in = device::buffer(device::Buffer::Input, total * h);
     float* d_out = device::buffer(device::Buffer::Output, total * h);
+    float* d_gateup = device::buffer(device::Buffer::Up, total * 2 * inter);
     float* d_gate = device::buffer(device::Buffer::Gate, total * inter);
-    float* d_up = device::buffer(device::Buffer::Up, total * inter);
 
     {
         APS_PROFILE_SCOPE("moe.gather");
@@ -241,16 +246,15 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     }
     {
         APS_PROFILE_SCOPE("mlp.forward");
-        { APS_PROFILE_SCOPE("mm.w1      [c,4096]x[448,4096]");
-          device::matmul_transposed_grouped(d_in, w1_all_, E, d_gate, d_tiles,
+        // w1 and w3 run as one 896-wide grouped GEMM (see layer.h): 448+448
+        // is exactly 7*128, so the 128-wide tile needs no padding, where 448
+        // alone pads to 512 (12.5% wasted columns). silu_mul_fused folds the
+        // silu+mul pair into one pass over the result.
+        { APS_PROFILE_SCOPE("mm.w13     [c,4096]x[896,4096]");
+          device::matmul_transposed_grouped(d_in, w13_all_, E, d_gateup, d_tiles,
                                             tiles.size(), kExpertBlockM); }
-        { APS_PROFILE_SCOPE("mlp.silu");
-          device::silu(d_gate, d_gate, total * inter); }
-        { APS_PROFILE_SCOPE("mm.w3      [c,4096]x[448,4096]");
-          device::matmul_transposed_grouped(d_in, w3_all_, E, d_up, d_tiles,
-                                            tiles.size(), kExpertBlockM); }
-        { APS_PROFILE_SCOPE("mlp.mul");
-          device::mul(d_gate, d_up, d_gate, total * inter); }
+        { APS_PROFILE_SCOPE("mlp.silu_mul");
+          device::silu_mul_fused(d_gateup, d_gate, total, inter); }
         { APS_PROFILE_SCOPE("mm.w2      [c,448]x[4096,448]");
           device::matmul_transposed_grouped(d_gate, w2_all_, E, d_out, d_tiles,
                                             tiles.size(), kExpertBlockM); }
