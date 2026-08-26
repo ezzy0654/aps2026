@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 
 PhiTinyMoEModel::PhiTinyMoEModel(const std::string& model_file)
     : loader_(model_file),
@@ -31,7 +32,8 @@ void PhiTinyMoEModel::forward(const std::vector<int>& input_ids, Tensor& logits)
 
 void PhiTinyMoEModel::forward_chunk(
     const std::vector<std::vector<int>>& chunk_ids,
-    const std::vector<std::size_t>& dest_rows, Tensor& out) const {
+    const std::vector<std::size_t>& dest_rows, Tensor& out,
+    std::thread* prefetch_thread) const {
     APS_PROFILE_SCOPE("model.forward_chunk");
     namespace device = tensor_ops::device;
     const std::size_t chunk_batch = chunk_ids.size();
@@ -152,9 +154,11 @@ void PhiTinyMoEModel::forward_chunk(
         // std::vector's zero-fill on first resize, or the first-touch page
         // faults during the D2H itself for `new float[n]`, cost far more
         // than the ~1023 calls' driver overhead this was meant to remove --
-        // `out`'s own backing memory is already resident (zero-filled once in
-        // generate()), so writing into it directly, as below, is what's
+        // `out`'s own backing memory is already resident (pre-faulted once
+        // in generate(), overlapped with the layer loop above -- see
+        // prefetch_thread), so writing into it directly, as below, is what's
         // actually cheap.
+        if (prefetch_thread && prefetch_thread->joinable()) prefetch_thread->join();
         for (std::size_t r = 0; r < chunk_batch; ++r) {
             device::check(cudaMemcpy(&out.at(dest_rows[r], 0),
                                      d_logits + r * apss26::VOCAB_SIZE,
@@ -178,7 +182,20 @@ void PhiTinyMoEModel::generate(
     // and chunks partition [0, batch) without gap or overlap. Safe to skip
     // the zero-fill Tensor(shape) would otherwise pay for nothing -- see
     // Tensor::uninitialized_parallel in tensor.h.
-    logits = Tensor::uninitialized_parallel({batch, apss26::VOCAB_SIZE});
+    //
+    // Allocation itself is cheap; the pre-fault pass is the ~15 ms part (see
+    // allocate_uninitialized's comment), and it depends on nothing the layer
+    // loop below computes. Run it on a background thread instead of paying
+    // it serially up front, so it overlaps the first chunk's ~1.9 s of
+    // layer-loop + lm_head-GEMM time; forward_chunk joins it right before
+    // the D2H writes that actually need the pages resident.
+    logits = Tensor::allocate_uninitialized({batch, apss26::VOCAB_SIZE});
+    std::thread fill_thread([&logits]() {
+        float* p = logits.data();
+        const long n = static_cast<long>(logits.size());
+#pragma omp parallel for schedule(static)
+        for (long i = 0; i < n; ++i) p[i] = 0.0f;
+    });
 
     // Sort by length descending (remembering each sequence's original
     // index) before packing into chunks: main.cpp's own input-format
@@ -228,9 +245,12 @@ void PhiTinyMoEModel::generate(
                 ++i;
             }
 
-            forward_chunk(chunk_ids, chunk_original_index, logits);
+            forward_chunk(chunk_ids, chunk_original_index, logits, &fill_thread);
         }
     }
+    // Already joined by the first forward_chunk call above; guards any
+    // future control-flow change that might skip that call.
+    if (fill_thread.joinable()) fill_thread.join();
 
     if (profiling::enabled()) profiling::report();
 }

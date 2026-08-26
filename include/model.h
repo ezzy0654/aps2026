@@ -2,6 +2,7 @@
 
 #include "layer.h"
 #include <string>
+#include <thread>
 #include <vector>
 
 class PhiTinyMoEModel {
@@ -36,6 +37,10 @@ private:
     // caller's final layout. Going through an intermediate [chunk, VOCAB]
     // Tensor and re-scattering it cost a 131MB zero-fill plus ~33M
     // bounds-checked element copies.
+    // prefetch_thread, when non-null and joinable, is joined right before the
+    // logits D2H writes below -- generate() uses it to overlap `out`'s
+    // page-prefault with this call's own layer loop (see generate()).
     void forward_chunk(const std::vector<std::vector<int>>& chunk_ids,
-                       const std::vector<std::size_t>& dest_rows, Tensor& out) const;
+                       const std::vector<std::size_t>& dest_rows, Tensor& out,
+                       std::thread* prefetch_thread = nullptr) const;
 };

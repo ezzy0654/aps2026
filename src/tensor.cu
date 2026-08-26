@@ -145,6 +145,17 @@ Tensor Tensor::uninitialized_parallel(std::vector<std::size_t> shape) {
     return t;
 }
 
+// See the declaration in tensor.h. Resize only -- no fill, parallel or
+// otherwise; the caller pre-faults on its own schedule.
+Tensor Tensor::allocate_uninitialized(std::vector<std::size_t> shape) {
+    Tensor t;
+    t.shape_ = std::move(shape);
+    std::size_t n = 1;
+    for (std::size_t d : t.shape_) n *= d;
+    t.data_.resize(n);
+    return t;
+}
+
 Tensor::~Tensor() { free_device(); }
 
 void Tensor::free_device() noexcept {

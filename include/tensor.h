@@ -101,6 +101,13 @@ public:
     // this for a buffer any code might read before writing (accumulators,
     // padding regions, anything relying on Tensor's normal zero-init).
     static Tensor uninitialized_parallel(std::vector<std::size_t> shape);
+    // Like uninitialized_parallel, but skips the pre-fault pass too --
+    // allocation alone (~0.025 ms even at 131 MB, see uninitialized_parallel's
+    // comment) is cheap; the pre-fault is the expensive part. Use this when
+    // the caller wants to run that pre-fault on its own schedule (e.g. a
+    // background thread overlapped with unrelated GPU work), touching every
+    // element via data()/size() before anything reads the buffer.
+    static Tensor allocate_uninitialized(std::vector<std::size_t> shape);
     ~Tensor();
     Tensor(const Tensor& other);
     Tensor& operator=(const Tensor& other);
