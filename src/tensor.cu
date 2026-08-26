@@ -1171,7 +1171,11 @@ __global__ __launch_bounds__(kAttnGroup * 32, 12) void sliding_window_attention_
         __syncthreads();
         if (lane < len) {
             const float4* __restrict__ q4 = reinterpret_cast<const float4*>(qv + d0);
-#pragma unroll
+            // Measured worse unrolled: +0.5-0.7% end-to-end with the pragma
+            // removed (ABBA, same srun allocation) -- unlike the GEMM's K-tile
+            // and store-epilogue loops, where removing #pragma unroll cost
+            // 7-10%. ptxas evidently schedules this 16-iteration loop better
+            // left rolled.
             for (int c = 0; c < kAttnDTile; c += 4) {
                 const float4 a = q4[c >> 2];
                 score += a.x * sK[lane][c + 0];
@@ -1186,7 +1190,8 @@ __global__ __launch_bounds__(kAttnGroup * 32, 12) void sliding_window_attention_
     // (2) Max, as a shuffle tree. Lanes past `len` carry -INFINITY, which is
     // fmaxf's identity, so a short row gives the same answer as a full one.
     float m = (lane < len) ? e : -INFINITY;
-#pragma unroll
+    // Same measured result as the dot-product loop above: rolled beats
+    // unrolled here (+0.4-0.5%), the opposite of the GEMM's hot loops.
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
 
     // (3) Per-element, so whichever lane evaluates it produces the same bits.
