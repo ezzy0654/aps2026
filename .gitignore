@@ -12,3 +12,8 @@ outputs.bin
 # 파이썬 가상환경 (tools/set_env.sh 가 만듦)
 .venv/
 __pycache__/
+
+# 프로파일링 산출물 (수십 MB 바이너리)
+*.ncu-rep
+*.nsys-rep
+*.sqlite

@@ -943,6 +943,134 @@ __global__ void sliding_window_attention_kernel(
     }
 }
 
+// Warp-per-query attention for the short-key case. ncu put 52.8% of the
+// general kernel's stall cycles on `barrier`: it runs five phases separated by
+// four block-wide __syncthreads(), and two of those phases execute on
+// threadIdx.x == 0 while the other 127 threads wait. The shape is right for
+// the window it was written against (2047 keys spread over 128 threads) and
+// wrong for the data, where a row's key list is capped by the trie at
+// max_len = 32.
+//
+// Once len <= 32 the whole score vector fits in one register per lane, so a
+// warp can carry a query from scores to output with no block-wide barrier at
+// all -- warp-level lockstep replaces every one of them. A block is one GQA
+// group (the q_heads sharing a kv head), which also puts the four warps that
+// read identical K and V rows next to each other in L1.
+//
+// The order-dependent steps are untouched: the K dot product still runs
+// d = 0..head_dim-1 inside a single lane, `denom` still sums idx = 0..len-1
+// sequentially, and the AV loop still divides per key rather than by a hoisted
+// reciprocal. Only the max scan changes shape, and fmaxf is associative and
+// commutative, so the shuffle tree returns the bits the sequential scan did.
+constexpr int kWarpAttnMaxLen = 32;   // lanes per warp: one score per lane
+constexpr int kAttnGroup = 4;         // warps per block = q_heads / kv_heads
+// K is staged 64 coordinates at a time. A full row would be 32*129*4 = 16.5 KB
+// and cap the SM at 6 blocks against the 12 the warp budget allows; half a row
+// is 8.3 KB and costs one block. The +1 is what makes the read conflict-free:
+// at stride 64 every lane of a warp would land on the same bank, at 65 lane j
+// reads bank (j + c) % 32.
+constexpr int kAttnDTile = 64;
+
+__global__ __launch_bounds__(kAttnGroup * 32, 12) void sliding_window_attention_warp_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, int q_heads, int kv_heads, int head_dim, int window,
+    const int* __restrict__ position_of_row, const int* __restrict__ path, int max_len) {
+    // Only the exponentials cross lanes, and only within a warp.
+    __shared__ float sE[kAttnGroup][kWarpAttnMaxLen];
+    // The group's K rows, shared by all four warps: they read identical rows,
+    // and reading them from global once per warp had L1 at 97% of peak.
+    __shared__ float sK[kWarpAttnMaxLen][kAttnDTile + 1];
+
+    const int qi = blockIdx.y;
+    const int kh = blockIdx.x;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int qh = kh * (q_heads / kv_heads) + warp;
+
+    const int pos = position_of_row[qi];
+    const int window_lo = pos - window + 1;
+    const int lo = (window_lo > 0) ? window_lo : 0;
+    const int len = pos - lo + 1;
+    const int* __restrict__ keys = path + static_cast<std::size_t>(qi) * max_len + lo;
+    const float scale = sqrtf(static_cast<float>(head_dim));
+    const float* __restrict__ qv =
+        q + static_cast<std::size_t>(qi) * q_heads * head_dim + static_cast<std::size_t>(qh) * head_dim;
+
+    // (1) One key per lane, accumulating d = 0..head_dim-1 in the reference's
+    // order. What changes is where the K element is read from.
+    //
+    // Reading it straight from global put the lanes of a warp on 32 *different*
+    // rows, so one load asked L1 for 32 separate 32 B sectors; the four warps
+    // then repeated all of it, since a GQA group's query heads share a kv head
+    // and therefore share every K row they touch. Staging the tile cooperatively
+    // makes the global side one contiguous run per row -- and the four warps
+    // read it once between them instead of four times each.
+    float score = 0.0f;
+    for (int d0 = 0; d0 < head_dim; d0 += kAttnDTile) {
+        __syncthreads();
+        // 128 threads over len rows x kAttnDTile coordinates: consecutive
+        // threads take consecutive coordinates of one row, so the global read
+        // is a full line and the shared store hits 32 distinct banks.
+        for (int t = static_cast<int>(threadIdx.x); t < len * kAttnDTile;
+             t += static_cast<int>(blockDim.x)) {
+            const int r = t / kAttnDTile, c = t - r * kAttnDTile;
+            sK[r][c] = k[static_cast<std::size_t>(keys[r]) * kv_heads * head_dim +
+                         static_cast<std::size_t>(kh) * head_dim + d0 + c];
+        }
+        __syncthreads();
+        if (lane < len) {
+            const float4* __restrict__ q4 = reinterpret_cast<const float4*>(qv + d0);
+#pragma unroll
+            for (int c = 0; c < kAttnDTile; c += 4) {
+                const float4 a = q4[c >> 2];
+                score += a.x * sK[lane][c + 0];
+                score += a.y * sK[lane][c + 1];
+                score += a.z * sK[lane][c + 2];
+                score += a.w * sK[lane][c + 3];
+            }
+        }
+    }
+    const float e = (lane < len) ? score / scale : 0.0f;
+
+    // (2) Max, as a shuffle tree. Lanes past `len` carry -INFINITY, which is
+    // fmaxf's identity, so a short row gives the same answer as a full one.
+    float m = (lane < len) ? e : -INFINITY;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+
+    // (3) Per-element, so whichever lane evaluates it produces the same bits.
+    const float ex = (lane < len) ? static_cast<float>(exp(static_cast<double>(e - m))) : 0.0f;
+    if (lane < len) sE[warp][lane] = ex;
+    __syncwarp();
+
+    // (4) Order-dependent, so still a sequential chain -- but every lane walks
+    // its own copy instead of 127 threads parking on a barrier behind one.
+    float denom = 0.0f;
+    for (int idx = 0; idx < len; ++idx) denom += sE[warp][idx];
+
+    // (5) Four output coordinates per lane, taken as one float4 so a warp's
+    // V read is 512 B of a single line rather than four 128 B ones. Each
+    // coordinate still gets its own accumulator walking idx = 0..len-1, and
+    // the divide still happens per key -- hoisting a reciprocal out of the
+    // loop would change the rounding.
+    float* __restrict__ outv =
+        out + static_cast<std::size_t>(qi) * q_heads * head_dim + static_cast<std::size_t>(qh) * head_dim;
+    for (int d0 = lane * 4; d0 < head_dim; d0 += 128) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+        for (int idx = 0; idx < len; ++idx) {
+            const float wgt = sE[warp][idx] / denom;
+            const float4 vv = *reinterpret_cast<const float4*>(
+                v + static_cast<std::size_t>(keys[idx]) * kv_heads * head_dim +
+                static_cast<std::size_t>(kh) * head_dim + d0);
+            ax += wgt * vv.x;
+            ay += wgt * vv.y;
+            az += wgt * vv.z;
+            aw += wgt * vv.w;
+        }
+        *reinterpret_cast<float4*>(outv + d0) = make_float4(ax, ay, az, aw);
+    }
+}
+
 // dst[i,:] = src[indices[i],:] — used to gather the tokens routed to one
 // MoE expert directly from the device-resident layer activation, with no
 // host round trip.
@@ -971,6 +1099,57 @@ __global__ void scatter_add_rows_kernel(float* __restrict__ dst, const float* __
     const std::size_t j = idx % row_width;
     dst[static_cast<std::size_t>(indices[i]) * row_width + j] += weights[i] * src[idx];
 }
+
+// Top-2 MoE routing, one thread per row. The reference's `select()` is not an
+// argmax and `best_value` is not a running maximum: it accepts index e only
+// when e beats the *last accepted* value by more than TIE_EPS, so the winner
+// is a greedy staircase that depends on the scan order. Measured against this
+// input's 498,656 real decisions, a stride-halving warp tree disagrees with it
+// on 8.41% of them and an adjacent-pair tree on 0.21%; the sequential scan
+// below agrees on all of them. So each thread runs both scans serially over
+// its 16 registers -- there is no parallelism to lose, since the rows
+// themselves supply 15,583-way work.
+//
+// The quantisation is the reference's expression unchanged. `fabsf` and
+// `floorf` are exact, and nvcc's default -prec-div=true makes `/ QUANTUM` the
+// same correctly-rounded divide x86 emits; an exhaustive sweep of all 2^32
+// float bit patterns found zero host/device disagreements. Never rewrite the
+// divide as a multiply by 1000.0f -- 1e-3f is 0.001000000047..., whose
+// reciprocal is not 1000, and the substitution moves 1 value in 249,328.
+__global__ void route_top2_kernel(const float* __restrict__ logits,
+                                  int2* __restrict__ out, int rows) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= rows) return;
+    const float* __restrict__ lg = logits + static_cast<std::size_t>(t) * apss26::NUM_EXPERTS;
+
+    float s[apss26::NUM_EXPERTS];
+#pragma unroll
+    for (int e = 0; e < static_cast<int>(apss26::NUM_EXPERTS); ++e) {
+        const float score = lg[e];
+        const float rounded = floorf(fabsf(score) / apss26::ROUTER_SCORE_QUANTUM + 0.5f) *
+                              apss26::ROUTER_SCORE_QUANTUM;
+        s[e] = score < 0.0f ? -rounded : rounded;
+    }
+
+    int first = -1;
+    float best = -INFINITY;
+#pragma unroll
+    for (int e = 0; e < static_cast<int>(apss26::NUM_EXPERTS); ++e)
+        if (first < 0 || s[e] > best + apss26::ROUTER_TIE_EPS) { first = e; best = s[e]; }
+
+    int second = -1;
+    float best2 = -INFINITY;
+#pragma unroll
+    for (int e = 0; e < static_cast<int>(apss26::NUM_EXPERTS); ++e) {
+        if (e == first) continue;
+        if (second < 0 || s[e] > best2 + apss26::ROUTER_TIE_EPS) { second = e; best2 = s[e]; }
+    }
+    out[t] = make_int2(first, second);
+}
+
+// Grow-on-demand device storage for the pairs above.
+struct RoutePairBuffer { int2* ptr = nullptr; std::size_t capacity = 0; };
+RoutePairBuffer g_route_pairs;
 
 // Dispatches on N: the register-blocked kernel pads N up to 64, so for the
 // MoE gate (N=16) the older 32-wide kernel wastes less. Both keep the same
@@ -1213,7 +1392,6 @@ void sliding_window_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     cuda_check(cudaMemcpy(d_v, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice), "attn H2D v");
 
     const dim3 grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(seq_len));
-    const std::size_t shared_bytes = window * sizeof(float);
     // The skeleton's Tensor form has no trie behind it: every row is its own
     // sequence position, so the path is the identity run 0..seq_len-1.
     std::vector<int> pos(seq_len), path(seq_len * seq_len);
@@ -1222,6 +1400,14 @@ void sliding_window_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         for (std::size_t j = 0; j <= r; ++j) path[r * seq_len + j] = static_cast<int>(j);
     }
     const device::RowMap rows = device::upload_row_map(pos.data(), path.data(), seq_len, seq_len);
+    // shared_e only ever holds `len` entries, and len <= min(window, max_len)
+    // -- the trie caps a row's key list at max_len (32 for this input) while
+    // window is 2047. Sizing by window alone asked for 8188 B to use 128 B,
+    // and ncu put Block Limit Shared Mem at 10 against Block Limit Warps 12:
+    // the over-allocation, not the kernel, was capping occupancy.
+    const std::size_t shared_bytes =
+        (window < static_cast<std::size_t>(rows.max_len) ? window
+                                                         : static_cast<std::size_t>(rows.max_len)) * sizeof(float);
     sliding_window_attention_kernel<<<grid, kAttnThreads, shared_bytes>>>(
         d_q, d_k, d_v, d_out, static_cast<int>(seq_len), static_cast<int>(q_heads),
         static_cast<int>(kv_heads), static_cast<int>(head_dim), static_cast<int>(window),
@@ -1423,13 +1609,53 @@ void sliding_window_attention(const float* d_q, const float* d_k, const float* d
                               std::size_t seq_len, std::size_t q_heads, std::size_t kv_heads,
                               std::size_t head_dim, std::size_t window,
                               const RowMap& rows, float* d_out) {
+    // A row's key list is capped by both the window and the trie's max_len.
+    // When that cap fits in a warp the barrier-free kernel above applies; the
+    // general one stays for any shape it does not cover (the Tensor-based
+    // entry point below builds an identity path, where max_len is seq_len).
+    const std::size_t key_cap =
+        (window < static_cast<std::size_t>(rows.max_len) ? window
+                                                         : static_cast<std::size_t>(rows.max_len));
+    if (key_cap <= static_cast<std::size_t>(kWarpAttnMaxLen) &&
+        kv_heads * kAttnGroup == q_heads && head_dim % kAttnDTile == 0) {
+        const dim3 grid(static_cast<unsigned>(kv_heads), static_cast<unsigned>(seq_len));
+        sliding_window_attention_warp_kernel<<<grid, kAttnGroup * 32>>>(
+            d_q, d_k, d_v, d_out, static_cast<int>(q_heads),
+            static_cast<int>(kv_heads), static_cast<int>(head_dim), static_cast<int>(window),
+            rows.position, rows.path, rows.max_len);
+        cuda_check(cudaGetLastError(), "device::sliding_window_attention warp kernel");
+        return;
+    }
+
     const dim3 grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(seq_len));
-    const std::size_t shared_bytes = window * sizeof(float);
+    // shared_e only ever holds `len` entries, so size it by that cap rather
+    // than by the window: this asked for 8188 B to use 128 B, and ncu put
+    // Block Limit Shared Mem at 10 against Block Limit Warps 12 -- the
+    // over-allocation, not the kernel, was capping occupancy.
+    const std::size_t shared_bytes = key_cap * sizeof(float);
     sliding_window_attention_kernel<<<grid, kAttnThreads, shared_bytes>>>(
         d_q, d_k, d_v, d_out, static_cast<int>(seq_len), static_cast<int>(q_heads),
         static_cast<int>(kv_heads), static_cast<int>(head_dim), static_cast<int>(window),
         rows.position, rows.path, rows.max_len);
     cuda_check(cudaGetLastError(), "device::sliding_window_attention kernel");
+}
+
+// The gate scores stay on the device: the 997 KB download they used to need
+// was a blocking sync 32 times over, and nsys measured 57 ms of GPU idle
+// behind it. What comes back instead is 2 ints per row.
+void route_top2(const float* d_router, int* host_pairs, std::size_t rows) {
+    if (rows == 0) return;
+    if (g_route_pairs.capacity < rows) {
+        if (g_route_pairs.ptr) cudaFree(g_route_pairs.ptr);
+        check(cudaMalloc(&g_route_pairs.ptr, rows * sizeof(int2)), "route_top2 cudaMalloc");
+        g_route_pairs.capacity = rows;
+    }
+    const int threads = 256;
+    const int blocks = static_cast<int>((rows + threads - 1) / threads);
+    route_top2_kernel<<<blocks, threads>>>(d_router, g_route_pairs.ptr, static_cast<int>(rows));
+    check(cudaGetLastError(), "route_top2 kernel");
+    check(cudaMemcpy(host_pairs, g_route_pairs.ptr, rows * sizeof(int2), cudaMemcpyDeviceToHost),
+          "route_top2 pairs D2H");
 }
 
 }  // namespace device

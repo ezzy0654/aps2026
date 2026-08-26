@@ -245,5 +245,10 @@ void sliding_window_attention(const float* d_q, const float* d_k, const float* d
                               std::size_t seq_len, std::size_t q_heads, std::size_t kv_heads,
                               std::size_t head_dim, std::size_t window,
                               const RowMap& rows, float* d_out);
+// Top-2 expert selection for `rows` gate-score vectors that are already on the
+// device. Fills host_pairs[2*r] / host_pairs[2*r+1] with row r's first and
+// second expert -- the same pair PhiMoE::route returns, bit for bit. Replaces
+// a 997 KB blocking download per layer with a 2-int-per-row one.
+void route_top2(const float* d_router, int* host_pairs, std::size_t rows);
 }  // namespace device
 }

@@ -59,6 +59,12 @@ void PhiMLP::forward_device(const float* d_x, float* d_y, std::size_t rows) cons
     { APS_PROFILE_SCOPE("mm.w2      [c,448]x[4096,448]");  tensor_ops::device::matmul_transposed(d_gate, w2_, d_y, rows); }
 }
 
+// The reference selection, kept as the specification this model's routing has
+// to match: device::route_top2 is a transliteration of the two scans below and
+// is what actually runs (see PhiMoE::forward_device). Retained because it is
+// the oracle any change to the device kernel must be diffed against -- the
+// arithmetic here is load-bearing in a way no comment can substitute for.
+//
 // `logits` points at this token's NUM_EXPERTS gate scores. Everything here
 // is a fixed 16 wide, so it lives on the stack: the previous version built a
 // Tensor (and two vectors) per token, which cost ~630k heap allocations per
@@ -142,24 +148,29 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     // matmul's input and every expert's gather source.
     const float* d_flat = d_x;
 
-    Tensor router({rows, E});
+    float* d_router = device::buffer(device::Buffer::Router, rows * E);
     {
         APS_PROFILE_SCOPE("moe.gate_matmul");
-        float* d_router = device::buffer(device::Buffer::Router, rows * E);
         device::matmul_transposed(d_flat, gate_, d_router, rows);
-        device::check(cudaMemcpy(router.data(), d_router, rows * E * sizeof(float),
-                                 cudaMemcpyDeviceToHost), "moe router D2H");
     }
 
     std::vector<std::vector<std::pair<std::size_t, float>>> assignments(E);
     {
         APS_PROFILE_SCOPE("moe.route");
-        const float* scores = router.data();
-        std::pair<int, float> r[2];
+        // Selection runs on the device (see device::route_top2); what the host
+        // still does is bucket the rows by expert. Reused across layers and
+        // chunks so this is not 32 allocations of the same 125 KB -- the host
+        // is single-threaded here, and forward_device is only ever called from
+        // the one decoder-layer loop.
+        static std::vector<int> pairs;
+        pairs.resize(2 * rows);
+        device::route_top2(d_router, pairs.data(), rows);
         for (std::size_t t = 0; t < rows; ++t) {
-            route(scores + t * E, r);
-            assignments[r[0].first].emplace_back(t, r[0].second);
-            assignments[r[1].first].emplace_back(t, r[1].second);
+            // Both weights are the model's fixed 0.5; expert order within a
+            // row is (first, second), which is what fixes the accumulation
+            // order in the per-expert scatter below.
+            assignments[pairs[2 * t]].emplace_back(t, 0.5f);
+            assignments[pairs[2 * t + 1]].emplace_back(t, 0.5f);
         }
     }
 
