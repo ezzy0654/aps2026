@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,8 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c);   // [M,K] 
 // also packs the whole batch into one [total_tokens, HIDDEN] pass -- see
 // docs/issue.md #1/#3).
 void matmul_transposed_gpu(const Tensor& a, const Tensor& b, Tensor& c);
+void matmul_transposed_bias_gpu(const Tensor& a, const Tensor& b,
+                                const Tensor& bias, Tensor& c);
 void matmul_pair_silu_gpu(const Tensor& a, const Tensor& gate_weight,
                           const Tensor& up_weight, Tensor& out);
 void matmul_pair_bias_gpu(const Tensor& a,
@@ -93,8 +96,46 @@ void attention_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
                    Tensor& out, const std::vector<std::size_t>& seq_lens,
                    std::size_t q_heads, std::size_t kv_heads,
                    std::size_t head_dim);
+// Prefix-trie variants of the two ops above. With prefix deduplication the
+// rows are trie nodes, so a row's RoPE position is its depth (`row_pos`) and
+// the keys it attends to are its ancestor chain, listed in depth order by
+// `anc[row * anc_stride + d]`. This removes the expand-to-token-rows /
+// contract-back round trip that attention otherwise needs.
+void apply_rope_tree_gpu(Tensor& q, Tensor& k,
+                         const std::uint32_t* row_pos, std::size_t rows,
+                         std::size_t max_seq, std::size_t q_heads,
+                         std::size_t kv_heads, std::size_t head_dim,
+                         float theta);
+void attention_tree_gpu(const Tensor& q, const Tensor& k, const Tensor& v,
+                        Tensor& out, const std::uint32_t* row_pos,
+                        const std::uint32_t* anc, std::size_t anc_stride,
+                        std::size_t rows, std::size_t max_seq,
+                        std::size_t q_heads, std::size_t kv_heads,
+                        std::size_t head_dim);
 void gather_rows_gpu(const Tensor& x, const std::vector<std::size_t>& rows,
                      Tensor& out);
+
+// A row-index map uploaded to the device once and reused across many gathers.
+// The std::vector overload above shares one static staging buffer and does a
+// blocking H2D copy per call, which is fine for the single end-of-run gather
+// but would serialize the pipeline if used per layer.
+class RowIndexBuffer {
+public:
+    RowIndexBuffer() = default;
+    explicit RowIndexBuffer(const std::vector<std::size_t>& rows);
+    ~RowIndexBuffer();
+    RowIndexBuffer(const RowIndexBuffer&) = delete;
+    RowIndexBuffer& operator=(const RowIndexBuffer&) = delete;
+    RowIndexBuffer(RowIndexBuffer&& other) noexcept;
+    RowIndexBuffer& operator=(RowIndexBuffer&& other) noexcept;
+    const std::uint32_t* data() const { return ptr_; }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+private:
+    std::uint32_t* ptr_ = nullptr;
+    std::size_t size_ = 0;
+};
+void gather_rows_gpu(const Tensor& x, const RowIndexBuffer& rows, Tensor& out);
 void scatter_add_rows_gpu(const Tensor& x,
                           const std::vector<std::size_t>& rows,
                           float scale, Tensor& out);

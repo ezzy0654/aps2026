@@ -1,6 +1,11 @@
 #include "model.h"
 #include "config.h"
+#include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <unordered_map>
 #include <stdexcept>
+#include <vector>
 
 PhiTinyMoEModel::PhiTinyMoEModel(const std::string& model_file)
     : loader_(model_file),
@@ -56,27 +61,98 @@ void PhiTinyMoEModel::generate(
         total += len;
     }
 
-    Tensor hidden({total, apss26::HIDDEN_SIZE});
-    for (std::size_t b = 0; b < batch; ++b) {
-        for (std::size_t si = 0; si < seq_lens[b]; ++si) {
-            const int token = input_ids[b][si];
-            if (token < 0 || static_cast<std::size_t>(token) >= apss26::VOCAB_SIZE) throw std::invalid_argument("token out of vocabulary");
-            const std::size_t row = offsets[b] + si;
-            for (std::size_t h = 0; h < apss26::HIDDEN_SIZE; ++h) hidden.at(row, h) = embeddings_.at(static_cast<std::size_t>(token), h);
+    // Prefix deduplication. Attention is causal and the sequences are
+    // independent, so a token's hidden state is a pure function of the prefix
+    // ending at it: two sequences sharing a prefix produce bit-identical rows
+    // there. Collapse the packed token rows onto the nodes of the prefix trie
+    // and run every row-wise op (LayerNorm, projections, MoE) on those. For
+    // this input that is 19,803 token rows -> 15,583 nodes.
+    //
+    // `token_node` maps each token row to its node. Attention runs directly on
+    // the node rows, so the trie walk also records, per node, its depth (which
+    // is its RoPE position) and its ancestor chain root -> node in depth order
+    // (which is exactly the set of keys its causal attention sees). Both are
+    // built here because this is where the trie already exists; the chain of a
+    // node created at position si is the running chain of the sequence being
+    // walked, so recording it costs one copy per node.
+    const std::size_t max_len =
+        *std::max_element(seq_lens.begin(), seq_lens.end());
+    std::vector<std::size_t> token_node(total), node_token, node_depth,
+        node_anc;
+    node_token.reserve(total);
+    node_depth.reserve(total);
+    node_anc.reserve(total * max_len);
+    {
+        std::unordered_map<std::uint64_t, std::uint32_t> children;
+        children.reserve(total * 2);
+        std::vector<std::size_t> chain(max_len);
+        for (std::size_t b = 0; b < batch; ++b) {
+            std::uint32_t parent = 0xFFFFFFFFu;  // virtual root
+            for (std::size_t si = 0; si < seq_lens[b]; ++si) {
+                const int token = input_ids[b][si];
+                if (token < 0 || static_cast<std::size_t>(token) >= apss26::VOCAB_SIZE) throw std::invalid_argument("token out of vocabulary");
+                const std::size_t row = offsets[b] + si;
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(parent + 1u) << 32) |
+                    static_cast<std::uint32_t>(token);
+                auto it = children.find(key);
+                std::uint32_t node;
+                if (it == children.end()) {
+                    node = static_cast<std::uint32_t>(node_token.size());
+                    node_token.push_back(static_cast<std::size_t>(token));
+                    node_depth.push_back(si);
+                    chain[si] = node;
+                    node_anc.resize(node_anc.size() + max_len, 0);
+                    std::copy(chain.begin(), chain.begin() + si + 1,
+                              node_anc.end() - max_len);
+                    children.emplace(key, node);
+                } else {
+                    node = it->second;
+                    chain[si] = node;
+                }
+                token_node[row] = node;
+                parent = node;
+            }
         }
     }
+    const std::size_t nodes = node_token.size();
 
-    for (const auto& layer : layers_) { Tensor next; layer.forward(hidden, next, seq_lens, /*use_gpu=*/true); hidden = std::move(next); }
+    // Embedding gather runs on the GPU. The embedding table is already
+    // device-resident, so gathering there replaces three host-side passes over
+    // 255 MB -- allocating and zero-filling the host buffer, the row memcpy,
+    // and the H2D upload of the result -- with a 62 KB index upload and one
+    // kernel. Those passes were pure host time with the GPU idle, since the
+    // hidden states are the first thing every layer needs. The bytes written
+    // are the same rows in the same order, so the result is bit-identical.
+    Tensor hidden({nodes, apss26::HIDDEN_SIZE});
+    tensor_ops::gather_rows_gpu(embeddings_, node_token, hidden);
 
+    const tensor_ops::RowIndexBuffer node_pos_rows(node_depth);
+    const tensor_ops::RowIndexBuffer node_anc_rows(node_anc);
+    PrefixExpansion expansion;
+    expansion.node_pos = &node_pos_rows;
+    expansion.node_anc = &node_anc_rows;
+    expansion.anc_stride = max_len;
+    expansion.max_seq = max_len;
+
+    Tensor carry;
+    bool has_carry = false;
+    for (const auto& layer : layers_) {
+        layer.forward_carry(hidden, carry, has_carry, seq_lens, expansion);
+        has_carry = true;
+    }
+
+    // The last layer's pending residual add folds into the final LayerNorm
+    // the same way it folds into every other one.
     Tensor normed(hidden.shape());
-    tensor_ops::layer_norm_gpu(
-        hidden, final_norm_weight_, final_norm_bias_,
+    tensor_ops::add_layer_norm_gpu(
+        hidden, carry, final_norm_weight_, final_norm_bias_,
         apss26::NORM_EPS, normed);
 
     Tensor last({batch, apss26::HIDDEN_SIZE});
     std::vector<std::size_t> last_rows(batch);
     for (std::size_t b = 0; b < batch; ++b)
-        last_rows[b] = offsets[b] + seq_lens[b] - 1;
+        last_rows[b] = token_node[offsets[b] + seq_lens[b] - 1];
     tensor_ops::gather_rows_gpu(normed, last_rows, last);
     lm_head_.forward(last, logits, /*use_gpu=*/true);
     logits.reshape({batch, apss26::VOCAB_SIZE});

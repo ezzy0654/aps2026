@@ -42,13 +42,34 @@ private:
     void route(const Tensor& logits, std::vector<std::pair<int, float>>& routes) const;
 };
 
+// Prefix deduplication: sequences that share a prefix have bit-identical
+// hidden states there, so the residual stream carries one row per distinct
+// trie node instead of one per token. Every row-wise op (LayerNorm, the
+// projections, MoE) then runs on the deduplicated rows.
+//
+// Attention runs on the node rows too. A node's causal context is exactly its
+// ancestor chain root -> node, which is unique per node, and its RoPE
+// position is its depth; `node_anc` lists that chain in depth order with
+// `anc_stride` entries per node and `node_pos` holds the depths. That makes
+// the per-layer expand-to-token-rows / contract-back round trip unnecessary.
+// A default-constructed value (node_anc == nullptr) means no deduplication
+// and every path behaves exactly as before.
+struct PrefixExpansion {
+    const tensor_ops::RowIndexBuffer* node_pos = nullptr;  // node row -> depth
+    const tensor_ops::RowIndexBuffer* node_anc = nullptr;  // node row -> chain
+    std::size_t anc_stride = 0;
+    std::size_t max_seq = 0;
+    bool active() const { return node_anc != nullptr; }
+};
+
 class PhiAttention {
 public:
     PhiAttention(const ModelLoader& loader, std::size_t layer_idx);
     // seq_lens: lengths of the sequences packed along x's row dimension;
     // attention (and RoPE) never crosses a segment boundary. Single-sequence
     // callers pass {x.size(0)}.
-    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false) const;
+    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false,
+                 const PrefixExpansion& expansion = {}) const;
 private:
     Linear q_proj_, k_proj_, v_proj_, o_proj_;
 };
@@ -56,7 +77,16 @@ private:
 class PhiDecoderLayer {
 public:
     PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_idx);
-    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false) const;
+    // Residual-carrying form used by the packed GPU path. On entry the layer
+    // input is `x` when `has_carry` is false and `x + carry` otherwise; on
+    // exit `x` holds the MoE output and `carry` the attention residual, so
+    // the pending add rides into the next LayerNorm instead of costing its
+    // own pass over the residual stream.
+    void forward_carry(Tensor& x, Tensor& carry, bool has_carry,
+                       const std::vector<std::size_t>& seq_lens,
+                       const PrefixExpansion& expansion) const;
+    void forward(const Tensor& x, Tensor& y, const std::vector<std::size_t>& seq_lens, bool use_gpu = false,
+                 const PrefixExpansion& expansion = {}) const;
 private:
     Tensor input_norm_weight_, input_norm_bias_;
     Tensor post_norm_weight_, post_norm_bias_;

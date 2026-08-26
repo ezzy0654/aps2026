@@ -17,3 +17,5 @@
 
 # Local backup files
 *.orig
+ncu-rep/
+*.ncu-rep
