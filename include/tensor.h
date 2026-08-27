@@ -195,6 +195,11 @@ enum class Buffer {
     // host transfers left in a forward pass are the initial embedding upload
     // and the final logits download.
     Hidden, Normed, Attn, Post, Q, K, V, AttnOut,
+    // Only the last layer's tail path uses these -- see PhiDecoderLayer::
+    // forward_device_tail. Distinct tags because NormedTail/XTail must stay
+    // alive alongside the full-size Normed buffer they're gathered from,
+    // and QTail/AttnCoreTail/AttnTail/PostTail alongside K/V (still full).
+    NormedTail, XTail, QTail, AttnCoreTail, AttnTail, PostTail,
     Count
 };
 
@@ -204,6 +209,10 @@ int* index_buffer(std::size_t elements);
 // Distinct from index_buffer, which PhiMoE overwrites once per expert: this
 // holds a chunk's token ids for the embedding gather.
 int* token_id_buffer(std::size_t elements);
+// Separate from index_buffer for the same reason: uploaded once before the
+// layer loop and read only by the last layer's tail path, so it must not
+// alias index_buffer's pool, which every layer's MoE call overwrites.
+int* tail_index_buffer(std::size_t elements);
 float* weight_buffer(std::size_t elements);
 // Per-chunk row metadata. Rows are no longer "sequence i's token j laid out
 // contiguously": identical prefixes are computed once and shared, so a row's
@@ -224,6 +233,11 @@ struct RowMap {
 };
 RowMap upload_row_map(const int* position, const int* path,
                       std::size_t rows, std::size_t max_len);
+// Same, but targets separate persistent buffers so the result stays valid
+// alongside a RowMap from upload_row_map above -- see PhiDecoderLayer::
+// forward_device_tail, the only caller that needs both at once.
+RowMap upload_row_map_tail(const int* position, const int* path,
+                           std::size_t rows, std::size_t max_len);
 
 // `bias`, when given, is folded into the GEMM's store: it used to be a
 // separate read-modify-write pass over C, moving 765 MB per layer to add an
@@ -259,6 +273,14 @@ void matmul_transposed_grouped(const float* d_a, const Tensor& weights,
                                std::size_t experts, float* d_c,
                                const GroupTile* d_tiles, std::size_t num_tiles,
                                std::size_t block_m, const int* d_a_index = nullptr);
+// Grouped w1||w3 GEMM with silu(w1) * w3 folded into the store. `weights`
+// must be laid out with each expert's rows reordered into 64-wide (w1
+// chunk, w3 chunk) pairs (see PhiMoE's constructor); `d_c` is
+// [rows, weights.size(0)/experts/2], not [rows, N]. block_m is always 128.
+void matmul_transposed_grouped_silu(const float* d_a, const Tensor& weights,
+                                    std::size_t experts, float* d_c,
+                                    const GroupTile* d_tiles, std::size_t num_tiles,
+                                    const int* d_a_index = nullptr);
 // Plain (uncompensated) accumulation — for the MoE gate only. Its scores feed
 // the router's quantized top-2 selection, which agrees with the reference's
 // expert choice more often with this than with a more accurate sum; see the
@@ -307,6 +329,15 @@ void add_layer_norm(float* d_x, const float* d_residual, const Tensor& weight,
 void apply_rope(float* d_q, float* d_k, std::size_t seq_len, std::size_t q_heads,
                 std::size_t kv_heads, std::size_t head_dim,
                 const RowMap& rows, const float2* rope_table);
+// Single-buffer halves of apply_rope, for the last layer's tail path: q is
+// rotated using the compressed tail RowMap (rows == chunk_batch, one row per
+// sequence's terminal node) while k keeps rotating on the full RowMap (rows
+// == total_tokens) -- both calls launch the exact same rope_kernel apply_rope
+// already uses, just once each instead of twice with a shared row count.
+void apply_rope_q(float* d_q, std::size_t rows, std::size_t q_heads, std::size_t head_dim,
+                  const RowMap& rows_map, const float2* rope_table);
+void apply_rope_k(float* d_k, std::size_t rows, std::size_t kv_heads, std::size_t head_dim,
+                  const RowMap& rows_map, const float2* rope_table);
 // Builds (and returns) that table in a persistent device buffer, overwritten
 // by the next call. max_positions must exceed every row's
 // `row - seq_start_of_row[row]`. Cheap enough -- 2048 entries for this

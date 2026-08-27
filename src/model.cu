@@ -98,6 +98,26 @@ void PhiTinyMoEModel::forward_chunk(
     const device::RowMap row_map =
         device::upload_row_map(position_of_row.data(), path.data(), total_tokens, max_len);
 
+    // The last layer's tail path (see PhiDecoderLayer::forward_device_tail)
+    // needs the same per-row position and ancestor-chain data as row_map,
+    // but with one row per sequence's terminal node instead of one per trie
+    // node. Built by copying each sequence's own row out of the arrays
+    // above -- final_row[i] is already exactly that row -- so it is a
+    // memory-layout change on data already computed, not a new computation.
+    std::vector<int> position_tail(chunk_batch);
+    std::vector<int> path_tail(chunk_batch * max_len);
+    for (std::size_t i = 0; i < chunk_batch; ++i) {
+        const int node = final_row[i];
+        position_tail[i] = position_of_row[static_cast<std::size_t>(node)];
+        std::memcpy(&path_tail[i * max_len], &path[static_cast<std::size_t>(node) * max_len],
+                    max_len * sizeof(int));
+    }
+    const device::RowMap row_map_tail =
+        device::upload_row_map_tail(position_tail.data(), path_tail.data(), chunk_batch, max_len);
+    int* d_tail_idx = device::tail_index_buffer(chunk_batch);
+    device::check(cudaMemcpy(d_tail_idx, final_row.data(), chunk_batch * sizeof(int),
+                             cudaMemcpyHostToDevice), "tail idx H2D");
+
     // One (cos, sin) rotation table for the whole chunk. RoPE's angle is a
     // function of (position, coordinate-pair index) and nothing else -- not the
     // data, not the head, not the layer -- so max_len * HEAD_DIM/2 entries
@@ -119,6 +139,8 @@ void PhiTinyMoEModel::forward_chunk(
         device::gather_rows(embeddings_.device_data(), d_a, d_ids, total_tokens, h);
     }
 
+    float* d_tail_y = nullptr;
+    float* d_tail_carry = nullptr;
     {
         APS_PROFILE_SCOPE("model.layers");
         // Ping-pong between the two buffers: a layer may not write its output
@@ -129,35 +151,43 @@ void PhiTinyMoEModel::forward_chunk(
         // LayerNorm folds the add into a pass it already makes. The carry is
         // read by that LayerNorm before attention_ overwrites Buffer::Attn,
         // so one buffer suffices.
-        for (const auto& layer : layers_) {
-            layer.forward_device(d_a, d_carry, d_b, total_tokens, row_map, d_rope_table);
-            d_carry = device::buffer(device::Buffer::Attn, n);
-            std::swap(d_a, d_b);
+        //
+        // The last layer takes the tail path instead: only the chunk_batch
+        // rows lm_head reads ever get read back out of it (every other row's
+        // q/attention/o_proj/post_norm/MoE output feeds a layer 32 that
+        // doesn't exist), so only those rows get computed for those stages.
+        // input_norm/k_proj/v_proj still run on every row -- see
+        // PhiDecoderLayer::forward_device_tail.
+        for (std::size_t li = 0; li < layers_.size(); ++li) {
+            const auto& layer = layers_[li];
+            if (li + 1 < layers_.size()) {
+                layer.forward_device(d_a, d_carry, d_b, total_tokens, row_map, d_rope_table);
+                d_carry = device::buffer(device::Buffer::Attn, n);
+                std::swap(d_a, d_b);
+            } else {
+                layer.forward_device_tail(d_a, d_carry, d_b, total_tokens, chunk_batch,
+                                          row_map, row_map_tail, d_rope_table, d_tail_idx);
+                d_tail_y = d_b;
+                d_tail_carry = device::buffer(device::Buffer::AttnTail, chunk_batch * h);
+            }
         }
     }
-    // After the swap in the last iteration, d_a holds the last layer's MoE
-    // output and d_carry its attention residual; the final LayerNorm below
-    // closes that last pair.
+    // d_tail_y holds the last layer's MoE output and d_tail_carry its
+    // attention residual, both [chunk_batch, h] -- the final LayerNorm below
+    // closes that last pair, same as it always has, just already compressed
+    // to the rows lm_head reads.
 
-    float* d_normed = device::buffer(device::Buffer::Normed, n);
+    float* d_normed = device::buffer(device::Buffer::Normed, chunk_batch * h);
     {
         APS_PROFILE_SCOPE("model.final_norm");
-        device::add_layer_norm(d_a, d_carry, final_norm_weight_, final_norm_bias_,
-                               apss26::NORM_EPS, d_normed, total_tokens, h);
+        device::add_layer_norm(d_tail_y, d_tail_carry, final_norm_weight_, final_norm_bias_,
+                               apss26::NORM_EPS, d_normed, chunk_batch, h);
     }
-
-    // Only each sequence's final row feeds lm_head, and after deduplication
-    // that row is its terminal trie node.
-    int* d_last_idx = device::index_buffer(chunk_batch);
-    device::check(cudaMemcpy(d_last_idx, final_row.data(), chunk_batch * sizeof(int),
-                             cudaMemcpyHostToDevice), "last-row idx H2D");
-    float* d_last = device::buffer(device::Buffer::Input, chunk_batch * h);
-    device::gather_rows(d_normed, d_last, d_last_idx, chunk_batch, h);
 
     {
         APS_PROFILE_SCOPE("model.lm_head");
         float* d_logits = device::buffer(device::Buffer::Output, chunk_batch * apss26::VOCAB_SIZE);
-        { APS_PROFILE_SCOPE("mm.lm_head [B,4096]x[32064,4096]"); lm_head_.forward_device(d_last, d_logits, chunk_batch); }
+        { APS_PROFILE_SCOPE("mm.lm_head [B,4096]x[32064,4096]"); lm_head_.forward_device(d_normed, d_logits, chunk_batch); }
         // Tried routing this through a bulk D2H into a fresh host staging
         // buffer plus a host-side gather, to replace chunk_batch separate
         // cudaMemcpy calls with one. Measured worse both ways: a

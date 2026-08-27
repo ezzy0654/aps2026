@@ -56,12 +56,17 @@ private:
     // kind. See tensor.h's matmul_transposed_grouped.
     //
     // w1 and w3 (each expert's gate/up projection, both [448, 4096]) are
-    // additionally concatenated ALONG N into w13_all_, [16*896, 4096] --
-    // expert e's rows [e*896, e*896+448) are w1, [e*896+448, (e+1)*896) are
-    // w3. 448+448 = 896 = 7*128 exactly, where 448 alone pads to 512 in the
-    // GEMM's 128-wide tile (12.5% wasted columns); one 896-wide grouped
-    // launch also replaces two, and its epilogue feeds directly into
-    // device::silu_mul_fused instead of separate silu/mul kernels.
+    // additionally combined into w13_all_, [16*896, 4096], one 896-wide
+    // grouped launch replacing two (448+448 = 896 = 7*128 exactly, where 448
+    // alone pads to 512 in the GEMM's 128-wide tile -- 12.5% wasted
+    // columns). Rows are NOT simple [w1; w3] concatenation: they're
+    // interleaved in 64-row (w1 chunk, w3 chunk) pairs -- expert e's rows
+    // [e*896 + c*128, e*896 + c*128 + 128) hold w1's rows [c*64, c*64+64)
+    // then w3's same range, for c = 0..6 -- so the GEMM's SILU_PAIR epilogue
+    // (tensor.cu) can read a thread's w1 and w3 outputs for the same
+    // interpolation index straight out of its own registers and fold
+    // silu(w1)*w3 into the store, rather than materialising [rows, 2*inter]
+    // for a separate silu_mul_fused pass to read back.
     Tensor w13_all_, w2_all_;
     // Reads this token's NUM_EXPERTS gate scores, writes its top-2 picks.
     void route(const float* logits, std::pair<int, float> routes[2]) const;
@@ -78,6 +83,21 @@ public:
     void forward_device(const float* d_x, float* d_y, std::size_t rows,
                         const tensor_ops::device::RowMap& row_map,
                         const float2* rope_table) const;
+    // Last-layer tail path: only the rows lm_head reads (one per sequence,
+    // its terminal trie node) need q/attention/o_proj at all -- nothing
+    // downstream reads any other row's output from this layer. k/v still
+    // need every row: they're read as ancestor keys by whichever *other*
+    // rows attend through this node. d_x_full feeds k_proj/v_proj (rows_full
+    // rows, row_map_full for k's RoPE and every row's own key lookup);
+    // d_x_tail feeds q_proj (rows_tail rows, row_map_tail -- the same
+    // per-node position and ancestor-chain data as row_map_full, just with
+    // one row per sequence's terminal node instead of one per trie node).
+    // d_y_tail is [rows_tail, hidden].
+    void forward_device_tail(const float* d_x_full, const float* d_x_tail, float* d_y_tail,
+                             std::size_t rows_full, std::size_t rows_tail,
+                             const tensor_ops::device::RowMap& row_map_full,
+                             const tensor_ops::device::RowMap& row_map_tail,
+                             const float2* rope_table) const;
 private:
     Linear q_proj_, k_proj_, v_proj_, o_proj_;
 };
@@ -98,6 +118,19 @@ public:
     void forward_device(float* d_x, const float* d_carry, float* d_y, std::size_t rows,
                         const tensor_ops::device::RowMap& row_map,
                         const float2* rope_table) const;
+    // Only the last layer calls this. d_x is the FULL [rows_full, hidden]
+    // hidden state, mutated in place to x+carry exactly like forward_device
+    // (input_norm still runs on every row -- k_proj/v_proj need it). d_y_tail
+    // is [rows_tail, hidden]: the raw MoE output for just the rows lm_head
+    // reads. This layer's own attention residual (attn + x_tail) for those
+    // same rows -- what forward_device would leave as the carry -- ends up
+    // in Buffer::AttnTail; model.cu re-fetches that pointer after this call
+    // returns, the same way it re-fetches Buffer::Attn after forward_device.
+    void forward_device_tail(float* d_x, const float* d_carry, float* d_y_tail,
+                             std::size_t rows_full, std::size_t rows_tail,
+                             const tensor_ops::device::RowMap& row_map_full,
+                             const tensor_ops::device::RowMap& row_map_tail,
+                             const float2* rope_table, const int* d_tail_index) const;
 private:
     Tensor input_norm_weight_, input_norm_bias_;
     Tensor post_norm_weight_, post_norm_bias_;

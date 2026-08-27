@@ -297,8 +297,20 @@ constexpr int kPad = 4;
 // VEC vectorises both the global load and the shared read into float4. It
 // needs K % 4 == 0 and 16B-aligned A/B, so launch_matmul checks and falls
 // back to the scalar path otherwise; the two produce identical results.
+// SILU_PAIR (only ever instantiated with TN=8, so VN=TN/4=2): folds the MoE
+// gate/up SiLU-and-multiply into this GEMM's store. A thread's two TN/4=2
+// column groups sit BN/VN = 128/2 = 64 apart -- so with B's rows reordered
+// into 64-wide (w1 chunk, w3 chunk) pairs per 128-wide N tile (see PhiMoE's
+// constructor) instead of the plain [w1(448); w3(448)] layout, those two
+// groups land on the same interpolation index's w1 and w3 outputs instead of
+// two unrelated columns, and the thread already holds both in registers when
+// it's about to store.
+// C's row stride is N/2 (== inter), not N -- this kernel produces the
+// [rows, inter] silu(w1)*w3 result directly, never materialising the
+// [rows, 2*inter] gate/up buffer the separate silu_mul_fused pass used to
+// read back.
 template <int BM, int BN, int TM, int TN, bool VEC, int NT = kThreads, int MINB = 2,
-          bool GATHER = false>
+          bool GATHER = false, bool SILU_PAIR = false>
 __global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(const float* __restrict__ A,
                                                  const float* __restrict__ B,
                                                  float* __restrict__ C,
@@ -523,6 +535,36 @@ __global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(con
                 const int gc = col0 + b_col + g * (BN / VN) + jj;
                 bv[g * 4 + jj] = (gc < N) ? bias[gc] : 0.0f;
             }
+    }
+
+    if constexpr (SILU_PAIR) {
+        static_assert(VN == 2, "SiLU-pair store needs exactly two column groups");
+        const int inter = N / 2;
+        const int chunk = col0 / BN;  // which 64-wide (w1,w3) pair this tile covers
+#pragma unroll
+        for (int f = 0; f < VM; ++f) {
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+                const int gr = row0 + a_row + f * (BM / VM) + ii;
+                if (gr >= m_end) continue;
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    const int j = chunk * (BN / VN) + b_col + jj;  // true inter index
+                    if (j >= inter) continue;
+                    const float g_val = acc[f * 4 + ii][0 * 4 + jj];  // w1 raw
+                    const float u_val = acc[f * 4 + ii][1 * 4 + jj];  // w3 raw
+                    // Character-for-character silu_mul_fused_kernel's formula:
+                    // exp evaluated in double (matches the reference's glibc
+                    // exp), then a single division and a single multiply --
+                    // no second product to contract differently depending on
+                    // context, unlike a rotation's two-term sum.
+                    const float e = static_cast<float>(exp(static_cast<double>(-g_val)));
+                    C[static_cast<std::size_t>(gr) * static_cast<std::size_t>(inter) + j] =
+                        (g_val / (1.0f + e)) * u_val;
+                }
+            }
+        }
+        return;
     }
 
 #pragma unroll
@@ -1859,7 +1901,18 @@ DeviceBufferBank<1> g_moe_weights;
 // valid across all 32 decoder layers of that same call.
 IntBuffer g_seq_start;
 IntBuffer g_row_path;
+// And separate again from g_seq_start/g_row_path themselves: the last
+// layer's tail RowMap (see upload_row_map_tail) must stay valid at the same
+// time as the full RowMap above -- both are read within that one layer's
+// forward_device_tail call -- so they cannot share upload_row_map's buffers.
+IntBuffer g_seq_start_tail;
+IntBuffer g_row_path_tail;
 IntBuffer g_token_ids;
+// Separate from g_moe_indices for the same reason g_token_ids is: uploaded
+// once before the layer loop and read only in the last layer's
+// forward_device_tail, so it must survive all 32 layers' MoE calls, each of
+// which overwrites g_moe_indices with that layer's own expert assignment.
+IntBuffer g_tail_index;
 }  // namespace
 
 void check(cudaError_t err, const char* what) { cuda_check(err, what); }
@@ -1886,6 +1939,15 @@ int* token_id_buffer(std::size_t elements) {
     return g_token_ids.ptr;
 }
 
+int* tail_index_buffer(std::size_t elements) {
+    if (g_tail_index.capacity_elements < elements) {
+        if (g_tail_index.ptr) cudaFree(g_tail_index.ptr);
+        cuda_check(cudaMalloc(&g_tail_index.ptr, elements * sizeof(int)), "tail_index_buffer cudaMalloc");
+        g_tail_index.capacity_elements = elements;
+    }
+    return g_tail_index.ptr;
+}
+
 float* weight_buffer(std::size_t elements) { return g_moe_weights.get(0, elements); }
 
 RowMap upload_row_map(const int* position, const int* path,
@@ -1906,6 +1968,28 @@ RowMap upload_row_map(const int* position, const int* path,
     cuda_check(cudaMemcpy(g_row_path.ptr, path, path_n * sizeof(int), cudaMemcpyHostToDevice),
                "row path H2D");
     return RowMap{g_seq_start.ptr, g_row_path.ptr, static_cast<int>(max_len)};
+}
+
+// Same as upload_row_map, targeting g_seq_start_tail/g_row_path_tail instead
+// so the result stays valid alongside the full RowMap from the same call.
+RowMap upload_row_map_tail(const int* position, const int* path,
+                           std::size_t rows, std::size_t max_len) {
+    if (g_seq_start_tail.capacity_elements < rows) {
+        if (g_seq_start_tail.ptr) cudaFree(g_seq_start_tail.ptr);
+        cuda_check(cudaMalloc(&g_seq_start_tail.ptr, rows * sizeof(int)), "tail row position cudaMalloc");
+        g_seq_start_tail.capacity_elements = rows;
+    }
+    const std::size_t path_n = rows * max_len;
+    if (g_row_path_tail.capacity_elements < path_n) {
+        if (g_row_path_tail.ptr) cudaFree(g_row_path_tail.ptr);
+        cuda_check(cudaMalloc(&g_row_path_tail.ptr, path_n * sizeof(int)), "tail row path cudaMalloc");
+        g_row_path_tail.capacity_elements = path_n;
+    }
+    cuda_check(cudaMemcpy(g_seq_start_tail.ptr, position, rows * sizeof(int), cudaMemcpyHostToDevice),
+              "tail row position H2D");
+    cuda_check(cudaMemcpy(g_row_path_tail.ptr, path, path_n * sizeof(int), cudaMemcpyHostToDevice),
+              "tail row path H2D");
+    return RowMap{g_seq_start_tail.ptr, g_row_path_tail.ptr, static_cast<int>(max_len)};
 }
 
 
@@ -2042,6 +2126,26 @@ void apply_rope(float* d_q, float* d_k, std::size_t seq_len, std::size_t q_heads
     cuda_check(cudaGetLastError(), "device::apply_rope kernel");
 }
 
+void apply_rope_q(float* d_q, std::size_t rows, std::size_t q_heads, std::size_t head_dim,
+                  const RowMap& rows_map, const float2* rope_table) {
+    const std::size_t half = head_dim / 2;
+    const int threads = 256;
+    const std::size_t total = rows * q_heads * half;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    rope_kernel<<<blocks, threads>>>(d_q, rows, q_heads, head_dim, rope_table, rows_map.position);
+    cuda_check(cudaGetLastError(), "device::apply_rope_q kernel");
+}
+
+void apply_rope_k(float* d_k, std::size_t rows, std::size_t kv_heads, std::size_t head_dim,
+                  const RowMap& rows_map, const float2* rope_table) {
+    const std::size_t half = head_dim / 2;
+    const int threads = 256;
+    const std::size_t total = rows * kv_heads * half;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    rope_kernel<<<blocks, threads>>>(d_k, rows, kv_heads, head_dim, rope_table, rows_map.position);
+    cuda_check(cudaGetLastError(), "device::apply_rope_k kernel");
+}
+
 const float2* build_rope_table(std::size_t max_positions, std::size_t head_dim, float theta) {
     return ensure_rope_table(max_positions, head_dim, theta);
 }
@@ -2073,6 +2177,45 @@ void matmul_transposed_grouped(const float* d_a, const Tensor& weights,
     const std::size_t n = weights.size(0) / experts;
     launch_matmul_grouped(d_a, weights.device_data(), d_c, d_tiles, num_tiles, k, n,
                           n * k, block_m, "matmul_transposed_grouped kernel", d_a_index);
+}
+
+// Grouped w1||w3 GEMM with SiLU(w1) * w3 folded into the store (see
+// SILU_PAIR in matmul_transposed_blocked_kernel). `weights` must already be
+// laid out with each expert's rows reordered into 64-wide (w1 chunk, w3
+// chunk) pairs -- PhiMoE's constructor does this once, before the timer
+// starts. `d_c` is [rows, weights.size(0)/experts/2] (== inter), not
+// [rows, N]. Only the block_m == 128 path exists: MoE's grouped launches are
+// always called with kExpertBlockM = 128.
+void matmul_transposed_grouped_silu(const float* d_a, const Tensor& weights,
+                                    std::size_t experts, float* d_c,
+                                    const GroupTile* d_tiles, std::size_t num_tiles,
+                                    const int* d_a_index) {
+    if (!weights.device_data())
+        throw std::runtime_error("matmul_transposed_grouped_silu: weights not resident on device");
+    const std::size_t k = weights.size(1);
+    const std::size_t n = weights.size(0) / experts;
+    if (n % 128 != 0) throw std::runtime_error("matmul_transposed_grouped_silu: N must be a multiple of 128");
+    const bool vec = (k % 4 == 0) &&
+                     (reinterpret_cast<std::uintptr_t>(d_a) % 16 == 0) &&
+                     (reinterpret_cast<std::uintptr_t>(weights.device_data()) % 16 == 0);
+    const bool gath = d_a_index != nullptr;
+    const int ki = static_cast<int>(k), ni = static_cast<int>(n);
+    const long long stride = static_cast<long long>(n * k);
+    const dim3 block(128 / 8, 128 / 16);
+    const dim3 grid(static_cast<unsigned>((n + 127) / 128), static_cast<unsigned>(num_tiles));
+    if (vec && gath)
+        matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1, true, true><<<grid, block>>>(
+            d_a, weights.device_data(), d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+    else if (vec)
+        matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1, false, true><<<grid, block>>>(
+            d_a, weights.device_data(), d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
+    else if (gath)
+        matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1, true, true><<<grid, block>>>(
+            d_a, weights.device_data(), d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+    else
+        matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1, false, true><<<grid, block>>>(
+            d_a, weights.device_data(), d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
+    cuda_check(cudaGetLastError(), "matmul_transposed_grouped_silu kernel");
 }
 
 void sliding_window_attention(const float* d_q, const float* d_k, const float* d_v,

@@ -106,15 +106,20 @@ PhiMoE::PhiMoE(const ModelLoader& loader, std::size_t layer_idx) {
     // it happens before the timer starts. What it buys is that all 16 expert
     // FFNs become a single grouped launch (see forward_device below).
     //
-    // w1 and w3 are additionally concatenated along N (see layer.h): expert
-    // e's block of w13_all_ holds its w1 rows [e*896, e*896+448) then its w3
-    // rows [e*896+448, (e+1)*896).
+    // w1 and w3 are additionally interleaved in 64-row chunks (matmul_
+    // transposed_grouped_silu's SILU_PAIR epilogue needs this -- see the
+    // kernel comment in tensor.cu): expert e's block of w13_all_ is 7 pairs
+    // of 64 rows, pair c holding w1's rows [c*64, c*64+64) then w3's same
+    // range, at [e*896 + c*128, e*896 + c*128 + 128). 448 = 7*64 exactly.
     const std::string first = base + ".experts.0";
     const Tensor w1_0 = loader.load(first + ".w1.weight");
     const Tensor w2_0 = loader.load(first + ".w2.weight");
     const Tensor w3_0 = loader.load(first + ".w3.weight");
     const std::size_t inter = w1_0.size(0), hidden = w1_0.size(1);
     const std::size_t E = apss26::NUM_EXPERTS;
+    constexpr std::size_t kChunk = 64;
+    if (inter % kChunk != 0) throw std::runtime_error("PhiMoE: EXPERT_INTERMEDIATE_SIZE must be a multiple of 64");
+    const std::size_t nchunks = inter / kChunk;
     w13_all_ = Tensor({E * 2 * inter, hidden});
     w2_all_ = Tensor({E * hidden, inter});
 
@@ -126,8 +131,12 @@ PhiMoE::PhiMoE(const ModelLoader& loader, std::size_t layer_idx) {
         const Tensor w1_e = (e == 0) ? w1_0 : loader.load(prefix + ".w1.weight");
         const Tensor w2_e = (e == 0) ? w2_0 : loader.load(prefix + ".w2.weight");
         const Tensor w3_e = (e == 0) ? w3_0 : loader.load(prefix + ".w3.weight");
-        stack_rows(w13_all_, w1_e, e * 2 * inter, hidden);
-        stack_rows(w13_all_, w3_e, e * 2 * inter + inter, hidden);
+        for (std::size_t c = 0; c < nchunks; ++c) {
+            std::memcpy(w13_all_.data() + (e * 2 * inter + c * 2 * kChunk) * hidden,
+                       w1_e.data() + c * kChunk * hidden, kChunk * hidden * sizeof(float));
+            std::memcpy(w13_all_.data() + (e * 2 * inter + c * 2 * kChunk + kChunk) * hidden,
+                       w3_e.data() + c * kChunk * hidden, kChunk * hidden * sizeof(float));
+        }
         stack_rows(w2_all_, w2_e, e * hidden, inter);
     }
     w13_all_.to_device();
@@ -236,15 +245,18 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
                              cudaMemcpyHostToDevice), "moe weights H2D");
 
     float* d_out = device::buffer(device::Buffer::Output, total * h);
-    float* d_gateup = device::buffer(device::Buffer::Up, total * 2 * inter);
     float* d_gate = device::buffer(device::Buffer::Gate, total * inter);
 
     {
         APS_PROFILE_SCOPE("mlp.forward");
         // w1 and w3 run as one 896-wide grouped GEMM (see layer.h): 448+448
         // is exactly 7*128, so the 128-wide tile needs no padding, where 448
-        // alone pads to 512 (12.5% wasted columns). silu_mul_fused folds the
-        // silu+mul pair into one pass over the result.
+        // alone pads to 512 (12.5% wasted columns). silu(w1)*w3 is folded
+        // into this GEMM's own store (SILU_PAIR in tensor.cu, needs the
+        // interleaved weight layout PhiMoE's constructor builds) instead of
+        // a separate silu_mul_fused pass: that pass read back and rewrote
+        // the [total, 2*inter] gate/up buffer this GEMM used to materialise,
+        // which no longer exists at all.
         //
         // The expert input is not materialised: d_idx is handed to the GEMM as
         // an A-row map, so the load that used to read a compacted copy reads
@@ -252,10 +264,8 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
         // copy -- 2*rows*4096 floats written and read again, for a buffer this
         // GEMM was the only consumer of -- is gone.
         { APS_PROFILE_SCOPE("mm.w13     [c,4096]x[896,4096]");
-          device::matmul_transposed_grouped(d_flat, w13_all_, E, d_gateup, d_tiles,
-                                            tiles.size(), kExpertBlockM, d_idx); }
-        { APS_PROFILE_SCOPE("mlp.silu_mul");
-          device::silu_mul_fused(d_gateup, d_gate, total, inter); }
+          device::matmul_transposed_grouped_silu(d_flat, w13_all_, E, d_gate, d_tiles,
+                                                 tiles.size(), d_idx); }
         { APS_PROFILE_SCOPE("mm.w2      [c,448]x[4096,448]");
           device::matmul_transposed_grouped(d_gate, w2_all_, E, d_out, d_tiles,
                                             tiles.size(), kExpertBlockM); }
@@ -314,6 +324,56 @@ void PhiAttention::forward_device(const float* d_x, float* d_y, std::size_t rows
     }
 }
 
+void PhiAttention::forward_device_tail(const float* d_x_full, const float* d_x_tail, float* d_y_tail,
+                                       std::size_t rows_full, std::size_t rows_tail,
+                                       const tensor_ops::device::RowMap& row_map_full,
+                                       const tensor_ops::device::RowMap& row_map_tail,
+                                       const float2* rope_table) const {
+    APS_PROFILE_SCOPE("attention.forward_tail");
+    namespace device = tensor_ops::device;
+    constexpr std::size_t q_dim = apss26::NUM_ATTENTION_HEADS * apss26::HEAD_DIM;
+    constexpr std::size_t kv_dim = apss26::NUM_KV_HEADS * apss26::HEAD_DIM;
+
+    // k/v: same as forward_device, full rows -- other rows' attention still
+    // needs them as ancestor keys.
+    float* d_k = device::buffer(device::Buffer::K, rows_full * kv_dim);
+    float* d_v = device::buffer(device::Buffer::V, rows_full * kv_dim);
+    // q: only the rows_tail rows anyone still reads.
+    float* d_q = device::buffer(device::Buffer::QTail, rows_tail * q_dim);
+    {
+        APS_PROFILE_SCOPE("attention.qkv_proj");
+        { APS_PROFILE_SCOPE("mm.q_proj  [T,4096]x[2048,4096]"); q_proj_.forward_device(d_x_tail, d_q, rows_tail); }
+        { APS_PROFILE_SCOPE("mm.k_proj  [T,4096]x[512,4096]");  k_proj_.forward_device(d_x_full, d_k, rows_full); }
+        { APS_PROFILE_SCOPE("mm.v_proj  [T,4096]x[512,4096]");  v_proj_.forward_device(d_x_full, d_v, rows_full); }
+    }
+    {
+        APS_PROFILE_SCOPE("attention.rope");
+        // Same rope_kernel as apply_rope, just q and k launched separately
+        // against their own row counts and RowMaps instead of a shared one.
+        device::apply_rope_q(d_q, rows_tail, apss26::NUM_ATTENTION_HEADS, apss26::HEAD_DIM,
+                             row_map_tail, rope_table);
+        device::apply_rope_k(d_k, rows_full, apss26::NUM_KV_HEADS, apss26::HEAD_DIM,
+                             row_map_full, rope_table);
+    }
+    float* d_out = device::buffer(device::Buffer::AttnCoreTail, rows_tail * q_dim);
+    {
+        APS_PROFILE_SCOPE("attention.core");
+        // seq_len/RowMap here govern the query side only (grid.y, and each
+        // query's own position + ancestor-chain lookup); k/v stay the full
+        // buffers above, addressed via row_map_tail's path entries, which are
+        // node indices into them -- identical mechanism to the normal path,
+        // just with the query loop's row count and RowMap swapped for the
+        // compressed ones.
+        device::sliding_window_attention(d_q, d_k, d_v, rows_tail, apss26::NUM_ATTENTION_HEADS,
+                                         apss26::NUM_KV_HEADS, apss26::HEAD_DIM,
+                                         apss26::SLIDING_WINDOW, row_map_tail, d_out);
+    }
+    {
+        APS_PROFILE_SCOPE("attention.o_proj");
+        { APS_PROFILE_SCOPE("mm.o_proj  [T,2048]x[4096,2048]"); o_proj_.forward_device(d_out, d_y_tail, rows_tail); }
+    }
+}
+
 PhiDecoderLayer::PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_idx)
     : input_norm_weight_(loader.load("model.layers." + std::to_string(layer_idx) + ".input_layernorm.weight")),
       input_norm_bias_(loader.load("model.layers." + std::to_string(layer_idx) + ".input_layernorm.bias")),
@@ -367,4 +427,50 @@ void PhiDecoderLayer::forward_device(float* d_x, const float* d_carry, float* d_
     // d_attn stays live as the carry. The next layer's input LayerNorm adds
     // them during a pass it was going to make anyway.
     moe_.forward_device(d_post, d_y, rows, h);
+}
+
+void PhiDecoderLayer::forward_device_tail(float* d_x, const float* d_carry, float* d_y_tail,
+                                          std::size_t rows_full, std::size_t rows_tail,
+                                          const tensor_ops::device::RowMap& row_map_full,
+                                          const tensor_ops::device::RowMap& row_map_tail,
+                                          const float2* rope_table, const int* d_tail_index) const {
+    APS_PROFILE_SCOPE("decoder.layer.forward_tail");
+    namespace device = tensor_ops::device;
+    const std::size_t h = apss26::HIDDEN_SIZE;
+
+    // Input LayerNorm still runs on every row: its output feeds k_proj/v_proj
+    // below, which need it for every row, not just the tail. d_x is mutated
+    // in place to x+carry exactly as forward_device does -- this layer being
+    // last doesn't change what its own residual math is, only how many rows
+    // of the *output* anything downstream reads.
+    float* d_normed = device::buffer(device::Buffer::Normed, rows_full * h);
+    { APS_PROFILE_SCOPE("layer.norm_add");
+      device::add_layer_norm(d_x, d_carry, input_norm_weight_, input_norm_bias_,
+                             apss26::NORM_EPS, d_normed, rows_full, h); }
+
+    // Compress to the rows lm_head reads (one per sequence: final_row from
+    // model.cu's trie build, uploaded as d_tail_index) before anything that
+    // only those rows need. Same gather_rows kernel the embedding lookup and
+    // the old pre-lm_head gather already used -- just run twice and earlier.
+    float* d_normed_tail = device::buffer(device::Buffer::NormedTail, rows_tail * h);
+    float* d_x_tail = device::buffer(device::Buffer::XTail, rows_tail * h);
+    { APS_PROFILE_SCOPE("layer.tail_gather");
+      device::gather_rows(d_normed, d_normed_tail, d_tail_index, rows_tail, h);
+      device::gather_rows(d_x, d_x_tail, d_tail_index, rows_tail, h); }
+
+    float* d_attn_tail = device::buffer(device::Buffer::AttnTail, rows_tail * h);
+    attention_.forward_device_tail(d_normed, d_normed_tail, d_attn_tail, rows_full, rows_tail,
+                                   row_map_full, row_map_tail, rope_table);
+
+    float* d_post_tail = device::buffer(device::Buffer::PostTail, rows_tail * h);
+    { APS_PROFILE_SCOPE("layer.norm_add");
+      // Same fold as forward_device's post-attention step, on the tail rows:
+      // d_attn_tail ends up holding attn + x_tail, which is this layer's
+      // (final, since there's no layer 32) carry -- the caller re-fetches
+      // Buffer::AttnTail for the final LayerNorm, mirroring how it re-fetches
+      // Buffer::Attn after the ordinary forward_device.
+      device::add_layer_norm(d_attn_tail, d_x_tail, post_norm_weight_, post_norm_bias_,
+                             apss26::NORM_EPS, d_post_tail, rows_tail, h); }
+
+    moe_.forward_device(d_post_tail, d_y_tail, rows_tail, h);
 }
