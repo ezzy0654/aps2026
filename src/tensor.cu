@@ -868,6 +868,71 @@ __global__ void layer_norm_warp_kernel(const float* __restrict__ x,
         yr[j] = (xr[j] - mean) * inv * weight[j] + bias[j];
 }
 
+// Residual add folded into the LayerNorm above. The add used to be its own
+// kernel -- read x, read r, write x, three passes over the whole residual
+// stream -- whose result this kernel then re-read as its first staging pass.
+// Folding it in removes exactly one of those passes: x + r is written back
+// once (the next stage still needs the sum as *its* residual) and every later
+// pass reads the sum instead of re-deriving it.
+//
+// Bit-identical by construction: the sums are formed elementwise with the
+// same two operands in the same order add_inplace used, and the mean and
+// variance chains are untouched -- still one thread walking j = 0..h-1.
+__global__ void add_layer_norm_warp_kernel(float* __restrict__ x,
+                                           const float* __restrict__ residual,
+                                           const float* __restrict__ weight,
+                                           const float* __restrict__ bias,
+                                           float eps, float* __restrict__ y,
+                                           int h, std::size_t rows) {
+    constexpr int kTile = 512;
+    extern __shared__ float smem[];
+
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const std::size_t warps_per_block = blockDim.x >> 5;
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x) * warps_per_block + warp;
+    if (row >= rows) return;
+
+    float* tile = smem + static_cast<std::size_t>(warp) * kTile;
+    float* xr = x + row * static_cast<std::size_t>(h);
+    const float* rr = residual + row * static_cast<std::size_t>(h);
+    const int ntiles = h / kTile;
+
+    // Pass 1 also performs the add and commits it, so passes 2 and 3 below
+    // are byte-for-byte the plain kernel's.
+    float mean = 0.0f;
+    for (int t = 0; t < ntiles; ++t) {
+        const int off = t * kTile;
+        for (int i = lane; i < kTile; i += 32) {
+            const float v = xr[off + i] + rr[off + i];
+            xr[off + i] = v;
+            tile[i] = v;
+        }
+        __syncwarp();
+        if (lane == 0)
+            for (int i = 0; i < kTile; ++i) mean += tile[i];
+        __syncwarp();
+    }
+    if (lane == 0) mean /= static_cast<float>(h);
+    mean = __shfl_sync(0xffffffffu, mean, 0);
+
+    float var = 0.0f;
+    for (int t = 0; t < ntiles; ++t) {
+        for (int i = lane; i < kTile; i += 32) tile[i] = xr[t * kTile + i];
+        __syncwarp();
+        if (lane == 0)
+            for (int i = 0; i < kTile; ++i) { const float d = tile[i] - mean; var += d * d; }
+        __syncwarp();
+    }
+    float inv = 0.0f;
+    if (lane == 0) inv = 1.0f / sqrtf(var / static_cast<float>(h) + eps);
+    inv = __shfl_sync(0xffffffffu, inv, 0);
+
+    float* yr = y + row * static_cast<std::size_t>(h);
+    for (int j = lane; j < h; j += 32)
+        yr[j] = (xr[j] - mean) * inv * weight[j] + bias[j];
+}
+
 // Grow-on-demand storage for the per-row (mean, inv) pair. Two floats per
 // row -- 125 KB at this input's row count.
 struct StatsBuffer { float2* ptr = nullptr; std::size_t capacity = 0; };
@@ -936,6 +1001,39 @@ void launch_layer_norm(const float* x, const float* weight, const float* bias, f
     const unsigned gy = static_cast<unsigned>(rows < 65535 ? rows : 65535);
     layer_norm_apply_kernel<<<dim3(gx, gy), athreads>>>(x, weight, bias, g_ln_stats.ptr, y, h, rows);
     cuda_check(cudaGetLastError(), "layer_norm kernel");
+}
+
+// Same dispatch rule as launch_layer_norm: the warp-per-row path needs h to
+// split into 512-float tiles. Anything else falls back to the two kernels
+// this fusion replaces, which produce identical values.
+void launch_add_layer_norm(float* x, const float* residual, const float* weight,
+                           const float* bias, float eps, float* y,
+                           std::size_t rows, std::size_t h) {
+    if (rows == 0 || h == 0) return;
+    constexpr int kTile = 512;
+    constexpr int kWarpsPerBlock = 8;
+    if (h % kTile == 0) {
+        static bool carveout_set = false;
+        if (!carveout_set) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(add_layer_norm_warp_kernel),
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            carveout_set = true;
+        }
+        const unsigned blocks = static_cast<unsigned>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        const std::size_t shared_bytes =
+            static_cast<std::size_t>(kWarpsPerBlock) * kTile * sizeof(float);
+        add_layer_norm_warp_kernel<<<blocks, kWarpsPerBlock * 32, shared_bytes>>>(
+            x, residual, weight, bias, eps, y, static_cast<int>(h), rows);
+        cuda_check(cudaGetLastError(), "add_layer_norm_warp kernel");
+        return;
+    }
+    const std::size_t n = rows * h;
+    const int threads = 256;
+    const int nblocks = static_cast<int>((n + threads - 1) / threads);
+    add_inplace_kernel<<<nblocks, threads>>>(x, residual, n);
+    cuda_check(cudaGetLastError(), "add_layer_norm fallback add");
+    launch_layer_norm(x, weight, bias, eps, y, rows, h);
 }
 
 // The rotation angle depends on exactly two things -- the token's position
@@ -1799,6 +1897,15 @@ void layer_norm(const float* d_x, const Tensor& weight, const Tensor& bias,
     if (!weight.device_data() || !bias.device_data())
         throw std::runtime_error("device::layer_norm: weight/bias not resident on device");
     launch_layer_norm(d_x, weight.device_data(), bias.device_data(), eps, d_y, rows, h);
+}
+
+void add_layer_norm(float* d_x, const float* d_residual, const Tensor& weight,
+                    const Tensor& bias, float eps, float* d_y,
+                    std::size_t rows, std::size_t h) {
+    if (!weight.device_data() || !bias.device_data())
+        throw std::runtime_error("device::add_layer_norm: weight/bias not resident on device");
+    launch_add_layer_norm(d_x, d_residual, weight.device_data(), bias.device_data(),
+                          eps, d_y, rows, h);
 }
 
 void apply_rope(float* d_q, float* d_k, std::size_t seq_len, std::size_t q_heads,

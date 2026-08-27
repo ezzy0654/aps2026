@@ -289,6 +289,14 @@ void add_inplace(float* d_a, const float* d_b, std::size_t n);
 void add_bias_inplace(float* d_a, const Tensor& bias, std::size_t n);
 void layer_norm(const float* d_x, const Tensor& weight, const Tensor& bias,
                 float eps, float* d_y, std::size_t rows, std::size_t h);
+// LayerNorm whose first staging pass also applies a residual add, replacing a
+// separate add_inplace whose output this kernel then re-read. `d_x` is updated
+// in place to hold x + residual, because the next stage needs that sum as its
+// own residual. Elementwise order matches add_inplace exactly, so the result
+// is bit-identical to running the two separately.
+void add_layer_norm(float* d_x, const float* d_residual, const Tensor& weight,
+                    const Tensor& bias, float eps, float* d_y,
+                    std::size_t rows, std::size_t h);
 // rope_table comes from build_rope_table below: max_positions * head_dim/2
 // (cos, sin) pairs, indexed by [position * half + j]. The rotation angle
 // depends only on those two indices -- not on the data, the head, or the

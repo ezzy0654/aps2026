@@ -339,12 +339,15 @@ void PhiDecoderLayer::forward_device(const float* d_x, float* d_y, std::size_t r
 
     float* d_attn = device::buffer(device::Buffer::Attn, n);
     attention_.forward_device(d_normed, d_attn, rows, row_map, rope_table);
-    { APS_PROFILE_SCOPE("layer.residual");
-      device::add_inplace(d_attn, d_x, n); }   // residual; d_x is not read after this
 
     float* d_post = device::buffer(device::Buffer::Post, n);
-    { APS_PROFILE_SCOPE("layer.norm");
-      device::layer_norm(d_attn, post_norm_weight_, post_norm_bias_, apss26::NORM_EPS, d_post, rows, h); }
+    { APS_PROFILE_SCOPE("layer.norm_add");
+      // The attention residual used to be its own add_inplace kernel and this
+      // LayerNorm then re-read its output -- one whole extra pass over the
+      // residual stream. Folded into the norm's staging pass; d_attn still
+      // ends up holding attn + x, which the second residual below needs.
+      device::add_layer_norm(d_attn, d_x, post_norm_weight_, post_norm_bias_,
+                             apss26::NORM_EPS, d_post, rows, h); }
 
     moe_.forward_device(d_post, d_y, rows, h);
     { APS_PROFILE_SCOPE("layer.residual");
