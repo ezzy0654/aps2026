@@ -110,6 +110,7 @@ void PhiTinyMoEModel::forward_chunk(
 
     float* d_a = device::buffer(device::Buffer::Hidden, n);
     float* d_b = device::buffer(device::Buffer::Y, n);
+    const float* d_carry = nullptr;   // no deferred residual before layer 0
     {
         APS_PROFILE_SCOPE("model.embedding");
         int* d_ids = device::token_id_buffer(total_tokens);
@@ -122,18 +123,27 @@ void PhiTinyMoEModel::forward_chunk(
         APS_PROFILE_SCOPE("model.layers");
         // Ping-pong between the two buffers: a layer may not write its output
         // over the input it still needs for the residual add.
+        //
+        // A layer now returns its raw MoE output plus a carry (its attention
+        // residual, living in Buffer::Attn), and the next layer's input
+        // LayerNorm folds the add into a pass it already makes. The carry is
+        // read by that LayerNorm before attention_ overwrites Buffer::Attn,
+        // so one buffer suffices.
         for (const auto& layer : layers_) {
-            layer.forward_device(d_a, d_b, total_tokens, row_map, d_rope_table);
+            layer.forward_device(d_a, d_carry, d_b, total_tokens, row_map, d_rope_table);
+            d_carry = device::buffer(device::Buffer::Attn, n);
             std::swap(d_a, d_b);
         }
     }
-    // After the swap in the last iteration, d_a holds the final hidden state.
+    // After the swap in the last iteration, d_a holds the last layer's MoE
+    // output and d_carry its attention residual; the final LayerNorm below
+    // closes that last pair.
 
     float* d_normed = device::buffer(device::Buffer::Normed, n);
     {
         APS_PROFILE_SCOPE("model.final_norm");
-        device::layer_norm(d_a, final_norm_weight_, final_norm_bias_, apss26::NORM_EPS,
-                           d_normed, total_tokens, h);
+        device::add_layer_norm(d_a, d_carry, final_norm_weight_, final_norm_bias_,
+                               apss26::NORM_EPS, d_normed, total_tokens, h);
     }
 
     // Only each sequence's final row feeds lm_head, and after deduplication

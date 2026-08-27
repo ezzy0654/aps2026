@@ -87,7 +87,15 @@ public:
     PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_idx);
     // Reads [rows, HIDDEN_SIZE] from d_x, writes the layer output to d_y.
     // d_y must not alias d_x.
-    void forward_device(const float* d_x, float* d_y, std::size_t rows,
+    //
+    // The layer no longer closes its own second residual. It returns the raw
+    // MoE output in d_y and leaves its attention residual in Buffer::Attn;
+    // the caller hands that back as `d_carry` on the next call, where the
+    // input LayerNorm's staging pass absorbs the add (see add_layer_norm).
+    // d_carry is null for the first layer, and the last layer's pair is
+    // closed by the final LayerNorm in model.cu. d_x is updated in place to
+    // x + carry, which is what the post-attention residual then reads.
+    void forward_device(float* d_x, const float* d_carry, float* d_y, std::size_t rows,
                         const tensor_ops::device::RowMap& row_map,
                         const float2* rope_table) const;
 private:

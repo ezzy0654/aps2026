@@ -325,7 +325,8 @@ PhiDecoderLayer::PhiDecoderLayer(const ModelLoader& loader, std::size_t layer_id
     post_norm_bias_.to_device();
 }
 
-void PhiDecoderLayer::forward_device(const float* d_x, float* d_y, std::size_t rows,
+void PhiDecoderLayer::forward_device(float* d_x, const float* d_carry, float* d_y,
+                                     std::size_t rows,
                                      const tensor_ops::device::RowMap& row_map,
                                      const float2* rope_table) const {
     APS_PROFILE_SCOPE("decoder.layer.forward");
@@ -334,8 +335,20 @@ void PhiDecoderLayer::forward_device(const float* d_x, float* d_y, std::size_t r
     const std::size_t n = rows * h;
 
     float* d_normed = device::buffer(device::Buffer::Normed, n);
-    { APS_PROFILE_SCOPE("layer.norm");
-      device::layer_norm(d_x, input_norm_weight_, input_norm_bias_, apss26::NORM_EPS, d_normed, rows, h); }
+    if (d_carry != nullptr) {
+        // The previous layer's second residual, deferred to here so this
+        // LayerNorm's staging pass absorbs it instead of a separate kernel
+        // writing a buffer this one would immediately re-read. d_carry points
+        // at Buffer::Attn, which attention_ below overwrites -- safe because
+        // this read completes first on the same stream.
+        APS_PROFILE_SCOPE("layer.norm_add");
+        device::add_layer_norm(d_x, d_carry, input_norm_weight_, input_norm_bias_,
+                               apss26::NORM_EPS, d_normed, rows, h);
+    } else {
+        APS_PROFILE_SCOPE("layer.norm");
+        device::layer_norm(d_x, input_norm_weight_, input_norm_bias_, apss26::NORM_EPS,
+                           d_normed, rows, h);
+    }
 
     float* d_attn = device::buffer(device::Buffer::Attn, n);
     attention_.forward_device(d_normed, d_attn, rows, row_map, rope_table);
@@ -349,7 +362,8 @@ void PhiDecoderLayer::forward_device(const float* d_x, float* d_y, std::size_t r
       device::add_layer_norm(d_attn, d_x, post_norm_weight_, post_norm_bias_,
                              apss26::NORM_EPS, d_post, rows, h); }
 
+    // The second residual is NOT closed here: d_y stays the raw MoE output and
+    // d_attn stays live as the carry. The next layer's input LayerNorm adds
+    // them during a pass it was going to make anyway.
     moe_.forward_device(d_post, d_y, rows, h);
-    { APS_PROFILE_SCOPE("layer.residual");
-      device::add_inplace(d_y, d_attn, n); }   // second residual
 }
