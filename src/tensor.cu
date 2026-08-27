@@ -615,6 +615,85 @@ __global__ void matmul_narrow_n_kernel(const float* __restrict__ A,
         C[static_cast<std::size_t>(gr) * N + e] = (bias != nullptr) ? acc + bias[e] : acc;
 }
 
+// Same job as matmul_narrow_n_kernel, but the shared tiles are k-major and a
+// thread owns four rows instead of one.
+//
+// The row-major layout above forces the inner loop to read two *scalars* per
+// FMA (As[r*LD+p] and Bs[e*LD+p], both p-strided). Per warp per k-tile that is
+// 128 LDS instructions against 16 clocks of FFMA -- the shared pipe is
+// oversubscribed 8x, which is why the kernel streams A at 217 GB/s, 23% of
+// DRAM peak, on a job whose only real work is streaming A once.
+//
+// Storing As[p][row] makes four consecutive rows contiguous, so one LDS.128
+// feeds four FMAs and B stays a single broadcast scalar: 5 clocks per warp-p
+// instead of 8 per FMA. LD = BM + 4 keeps the transposing store off a single
+// bank (68 mod 32 = 4). Each acc[r] still walks p = 0..K-1 in ascending order,
+// so the sums are the reference's, unchanged.
+constexpr int kNarrowBM = 64;
+constexpr int kNarrowBK = 32;
+constexpr int kNarrowMaxN = 32;
+constexpr int kNarrowThreads = 256;
+constexpr int kNarrowLD = kNarrowBM + 4;
+__global__ __launch_bounds__(kNarrowThreads) void matmul_narrow_wide_kernel(
+    const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ C, int M, int K, int N,
+    const float* __restrict__ bias) {
+    __shared__ __align__(16) float As[kNarrowBK][kNarrowLD];
+    __shared__ __align__(16) float Bs[kNarrowBK][kNarrowMaxN];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tx = tid & 15;            // output column
+    const int ty = tid >> 4;            // row group of four
+    const int row0 = static_cast<int>(blockIdx.x) * kNarrowBM;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int tiles = K / kNarrowBK;
+    for (int t = 0; t < tiles; ++t) {
+        const int p0 = t * kNarrowBK;
+#pragma unroll
+        for (int i = 0; i < (kNarrowBM * kNarrowBK) / (4 * kNarrowThreads); ++i) {
+            const int v = tid + i * kNarrowThreads;
+            const int lr = v >> 3, kc = (v & 7) * 4;
+            const int gr = row0 + lr;
+            float4 val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (gr < M) val = *reinterpret_cast<const float4*>(A + static_cast<std::size_t>(gr) * K + p0 + kc);
+            As[kc + 0][lr] = val.x;
+            As[kc + 1][lr] = val.y;
+            As[kc + 2][lr] = val.z;
+            As[kc + 3][lr] = val.w;
+        }
+        if (tid < N * (kNarrowBK / 4)) {
+            const int col = tid >> 3, kc = (tid & 7) * 4;
+            const float4 val = *reinterpret_cast<const float4*>(B + static_cast<std::size_t>(col) * K + p0 + kc);
+            Bs[kc + 0][col] = val.x;
+            Bs[kc + 1][col] = val.y;
+            Bs[kc + 2][col] = val.z;
+            Bs[kc + 3][col] = val.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < kNarrowBK; ++p) {
+            const float bv = Bs[p][tx];
+            const float4 av = *reinterpret_cast<const float4*>(&As[p][ty * 4]);
+            acc[0] += av.x * bv;
+            acc[1] += av.y * bv;
+            acc[2] += av.z * bv;
+            acc[3] += av.w * bv;
+        }
+        __syncthreads();
+    }
+    if (tx < N) {
+        const float bb = (bias != nullptr) ? bias[tx] : 0.0f;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int gr = row0 + ty * 4 + r;
+            if (gr < M)
+                C[static_cast<std::size_t>(gr) * N + tx] =
+                    (bias != nullptr) ? acc[r] + bb : acc[r];
+        }
+    }
+}
+
 // Narrow-N fallback (one output per thread, 32x32 tile). The blocked kernel
 // above pads N up to 64, which would waste 3/4 of every block on the MoE
 // gate (N=16); this wastes only half. Same K order, so the two agree bitwise.
@@ -1494,6 +1573,13 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
         // than tile it. Falls back to the old kernel if the row group's shared
         // tile would not fit; both produce identical results.
         const int nn = static_cast<int>(n);
+        if (nn <= kNarrowMaxN && k % kNarrowBK == 0 && vec) {
+            const dim3 grid(static_cast<unsigned>((m + kNarrowBM - 1) / kNarrowBM));
+            matmul_narrow_wide_kernel<<<grid, kNarrowThreads>>>(
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), nn, d_bias);
+            cuda_check(cudaGetLastError(), what);
+            return;
+        }
         int nrow = 256 / nn; if (nrow > 32) nrow = 32; if (nrow < 1) nrow = 1;
         const std::size_t shb =
             static_cast<std::size_t>(nrow + nn) * 65 * sizeof(float);
