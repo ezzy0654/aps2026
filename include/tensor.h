@@ -62,7 +62,7 @@ namespace detail {
 // resize() on a vector using it becomes allocation-only. Tensor's normal
 // constructor re-implements the zero-fill explicitly right after, so every
 // existing caller sees identical values and cost; only a caller that
-// deliberately skips that explicit fill (see Tensor::uninitialized_parallel)
+// deliberately skips that explicit fill (see Tensor::allocate_uninitialized)
 // gets a different result.
 template <typename T>
 struct DefaultInitAllocator : std::allocator<T> {
@@ -100,13 +100,11 @@ public:
     // spot right before the D2H copy that spans it completely. Never use
     // this for a buffer any code might read before writing (accumulators,
     // padding regions, anything relying on Tensor's normal zero-init).
-    static Tensor uninitialized_parallel(std::vector<std::size_t> shape);
-    // Like uninitialized_parallel, but skips the pre-fault pass too --
-    // allocation alone (~0.025 ms even at 131 MB, see uninitialized_parallel's
-    // comment) is cheap; the pre-fault is the expensive part. Use this when
-    // the caller wants to run that pre-fault on its own schedule (e.g. a
-    // background thread overlapped with unrelated GPU work), touching every
-    // element via data()/size() before anything reads the buffer.
+    // Allocation alone: no fill, parallel or otherwise. Allocation is ~0.025 ms
+    // even at 131 MB; the first-touch pre-fault is the ~15 ms part, so this
+    // hands that back to the caller to run on its own schedule (e.g. a
+    // background thread overlapped with unrelated GPU work). The caller MUST
+    // touch every element via data()/size() before anything reads the buffer.
     static Tensor allocate_uninitialized(std::vector<std::size_t> shape);
     ~Tensor();
     Tensor(const Tensor& other);

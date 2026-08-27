@@ -191,7 +191,7 @@ void PhiTinyMoEModel::generate(
     // D2H loop writes exactly one full row per original sequence index,
     // and chunks partition [0, batch) without gap or overlap. Safe to skip
     // the zero-fill Tensor(shape) would otherwise pay for nothing -- see
-    // Tensor::uninitialized_parallel in tensor.h.
+    // Tensor::allocate_uninitialized in tensor.h.
     //
     // Allocation itself is cheap; the pre-fault pass is the ~15 ms part (see
     // allocate_uninitialized's comment), and it depends on nothing the layer
