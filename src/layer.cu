@@ -235,24 +235,25 @@ void PhiMoE::forward_device(const float* d_x, float* d_y, std::size_t rows, std:
     device::check(cudaMemcpy(d_w, all_w.data(), total * sizeof(float),
                              cudaMemcpyHostToDevice), "moe weights H2D");
 
-    float* d_in = device::buffer(device::Buffer::Input, total * h);
     float* d_out = device::buffer(device::Buffer::Output, total * h);
     float* d_gateup = device::buffer(device::Buffer::Up, total * 2 * inter);
     float* d_gate = device::buffer(device::Buffer::Gate, total * inter);
 
-    {
-        APS_PROFILE_SCOPE("moe.gather");
-        device::gather_rows(d_flat, d_in, d_idx, total, h);
-    }
     {
         APS_PROFILE_SCOPE("mlp.forward");
         // w1 and w3 run as one 896-wide grouped GEMM (see layer.h): 448+448
         // is exactly 7*128, so the 128-wide tile needs no padding, where 448
         // alone pads to 512 (12.5% wasted columns). silu_mul_fused folds the
         // silu+mul pair into one pass over the result.
+        //
+        // The expert input is not materialised: d_idx is handed to the GEMM as
+        // an A-row map, so the load that used to read a compacted copy reads
+        // the residual stream directly. The gather_rows pass that built that
+        // copy -- 2*rows*4096 floats written and read again, for a buffer this
+        // GEMM was the only consumer of -- is gone.
         { APS_PROFILE_SCOPE("mm.w13     [c,4096]x[896,4096]");
-          device::matmul_transposed_grouped(d_in, w13_all_, E, d_gateup, d_tiles,
-                                            tiles.size(), kExpertBlockM); }
+          device::matmul_transposed_grouped(d_flat, w13_all_, E, d_gateup, d_tiles,
+                                            tiles.size(), kExpertBlockM, d_idx); }
         { APS_PROFILE_SCOPE("mlp.silu_mul");
           device::silu_mul_fused(d_gateup, d_gate, total, inter); }
         { APS_PROFILE_SCOPE("mm.w2      [c,448]x[4096,448]");

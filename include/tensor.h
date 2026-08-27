@@ -252,10 +252,15 @@ struct GroupTile {
 // next call. Callers building two maps (different block_m) should concatenate
 // them and offset into the returned pointer.
 const GroupTile* upload_group_tiles(const GroupTile* host, std::size_t n);
+// d_a_index, when given, turns the A load into a gather: block row r reads
+// d_a row d_a_index[r] instead of row r. It replaces a standalone gather_rows
+// pass whose output this GEMM was the only consumer of. The lookup is hoisted
+// out of the K loop (four rows per thread, four registers), so it adds no
+// per-iteration cost.
 void matmul_transposed_grouped(const float* d_a, const Tensor& weights,
                                std::size_t experts, float* d_c,
                                const GroupTile* d_tiles, std::size_t num_tiles,
-                               std::size_t block_m);
+                               std::size_t block_m, const int* d_a_index = nullptr);
 // Plain (uncompensated) accumulation — for the MoE gate only. Its scores feed
 // the router's quantized top-2 selection, which agrees with the reference's
 // expert choice more often with this than with a more accurate sum; see the

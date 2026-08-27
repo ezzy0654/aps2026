@@ -311,14 +311,16 @@ constexpr int kPad = 4;
 // VEC vectorises both the global load and the shared read into float4. It
 // needs K % 4 == 0 and 16B-aligned A/B, so launch_matmul checks and falls
 // back to the scalar path otherwise; the two produce identical results.
-template <int BM, int BN, int TM, int TN, bool VEC, int NT = kThreads, int MINB = 2>
+template <int BM, int BN, int TM, int TN, bool VEC, int NT = kThreads, int MINB = 2,
+          bool GATHER = false>
 __global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(const float* __restrict__ A,
                                                  const float* __restrict__ B,
                                                  float* __restrict__ C,
                                                  int M, int K, int N,
                                                  const tensor_ops::device::GroupTile* __restrict__ tiles,
                                                  long long weight_stride,
-                                                 const float* __restrict__ bias) {
+                                                 const float* __restrict__ bias,
+                                                 const int* __restrict__ a_index) {
     static_assert(TM % 4 == 0 && TN % 4 == 0, "micro-tile must be float4-shaped");
     // Each thread's TM rows are split into TM/4 groups of 4 *contiguous*
     // rows, the groups spread BM/(TM/4) apart. The earlier layout gave a
@@ -378,13 +380,34 @@ __global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(con
         constexpr int kVecK = kBlockK / 4;
         float4 ra[AL], rb[BL];
 
+        // GATHER folds what used to be a standalone gather_rows kernel -- a
+        // 511 MB write plus a 511 MB read of a compacted copy this GEMM is the
+        // only consumer of -- into the address of the A load. The whole trick
+        // is that the lookup is hoisted here, outside the K loop: with
+        // AL = BM*kBlockK/(4*NT) = 4, a thread stages the same four rows on
+        // every K tile, so four registers hold their gathered indices for the
+        // entire kernel. Earlier attempts put the map inside the K loop (one
+        // extra LDS per A-load) or held sixteen indices from the scalar
+        // staging layout (24 B of spill), and both lost; neither cost applies
+        // to this form.
+        int a_gr[GATHER ? AL : 1];
+        if constexpr (GATHER) {
+#pragma unroll
+            for (int i = 0; i < AL; ++i) {
+                const int r = row0 + (tid + i * NT) / kVecK;
+                a_gr[i] = (r < m_end) ? a_index[r] : -1;
+            }
+        }
+
 
 #define APS_ISSUE(k0)                                                                 \
         _Pragma("unroll")                                                             \
         for (int i = 0; i < AL; ++i) {                                                \
             const int lin = tid + i * NT, m = lin / kVecK, q = lin % kVecK;            \
-            const int gr = row0 + m, gk = (k0) + q * 4;                                \
-            ra[i] = (gr < m_end && gk + 3 < K)                                         \
+            const int gr = GATHER ? a_gr[i] : (row0 + m);                              \
+            const bool live = GATHER ? (gr >= 0) : (gr < m_end);                       \
+            const int gk = (k0) + q * 4;                                               \
+            ra[i] = (live && gk + 3 < K)                                               \
                   ? *reinterpret_cast<const float4*>(A + static_cast<std::size_t>(gr) * K + gk) \
                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                               \
         }                                                                             \
@@ -457,8 +480,12 @@ __global__ __launch_bounds__(NT, MINB) void matmul_transposed_blocked_kernel(con
             for (int i = 0; i < (BM * kBlockK) / NT; ++i) {
                 const int lin = tid + i * NT;
                 const int m = lin / kBlockK, p = lin % kBlockK;
-                const int gr = row0 + m, gk = k0 + p;
-                As[0][p][m] = (gr < m_end && gk < K) ? A[static_cast<std::size_t>(gr) * K + gk] : 0.0f;
+                const int gr0 = row0 + m, gk = k0 + p;
+                // Never taken for the MoE (K = 4096 is float4-clean), so the
+                // per-element lookup here is correctness, not a fast path.
+                const int gr = GATHER ? ((gr0 < m_end) ? a_index[gr0] : -1) : gr0;
+                const bool live = GATHER ? (gr >= 0) : (gr0 < m_end);
+                As[0][p][m] = (live && gk < K) ? A[static_cast<std::size_t>(gr) * K + gk] : 0.0f;
             }
 #pragma unroll
             for (int i = 0; i < (BN * kBlockK) / NT; ++i) {
@@ -1516,9 +1543,9 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
         const dim3 grid(static_cast<unsigned>((n + 127) / 128),
                         static_cast<unsigned>((m + 127) / 128));
         if (vec) matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1><<<grid, block>>>(
-                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
+                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias, nullptr);
         else     matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1><<<grid, block>>>(
-                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias);
+                     d_a, d_b, d_c, (int)m, (int)k, (int)n, nullptr, 0, d_bias, nullptr);
     } else {
         // Too few blocks at 128x128 (the MoE experts land here): a smaller
         // tile spreads the work over more SMs, which outweighs re-reading.
@@ -1527,10 +1554,10 @@ void launch_matmul(const float* d_a, const float* d_b, float* d_c,
                         static_cast<unsigned>((m + 63) / 64));
         if (vec)
             matmul_transposed_blocked_kernel<64, 64, 4, 4, true><<<grid, block>>>(
-                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias);
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias, nullptr);
         else
             matmul_transposed_blocked_kernel<64, 64, 4, 4, false><<<grid, block>>>(
-                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias);
+                d_a, d_b, d_c, static_cast<int>(m), static_cast<int>(k), static_cast<int>(n), nullptr, 0, d_bias, nullptr);
     }
     cuda_check(cudaGetLastError(), what);
 }
@@ -1542,27 +1569,44 @@ void launch_matmul_grouped(const float* d_a, const float* d_b, float* d_c,
                            const tensor_ops::device::GroupTile* d_tiles,
                            std::size_t num_tiles, std::size_t k, std::size_t n,
                            std::size_t weight_stride, std::size_t block_m,
-                           const char* what) {
+                           const char* what, const int* d_a_index) {
     if (num_tiles == 0) return;
     const bool vec = (k % 4 == 0) &&
                      (reinterpret_cast<std::uintptr_t>(d_a) % 16 == 0) &&
                      (reinterpret_cast<std::uintptr_t>(d_b) % 16 == 0);
+    const bool gath = d_a_index != nullptr;
     const int ki = static_cast<int>(k), ni = static_cast<int>(n);
     const long long stride = static_cast<long long>(weight_stride);
     if (block_m == 128) {
         const dim3 block(128 / 8, 128 / 16);
         const dim3 grid(static_cast<unsigned>((n + 127) / 128), static_cast<unsigned>(num_tiles));
-        if (vec) matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
-        else     matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
+        if (vec && gath)
+            matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1, true><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+        else if (vec)
+            matmul_transposed_blocked_kernel<128, 128, 16, 8, true, 128, 1, false><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
+        else if (gath)
+            matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1, true><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+        else
+            matmul_transposed_blocked_kernel<128, 128, 16, 8, false, 128, 1, false><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
     } else {
         const dim3 block(64 / 4, 64 / 4);
         const dim3 grid(static_cast<unsigned>((n + 63) / 64), static_cast<unsigned>(num_tiles));
-        if (vec) matmul_transposed_blocked_kernel<64, 64, 4, 4, true><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
-        else     matmul_transposed_blocked_kernel<64, 64, 4, 4, false><<<grid, block>>>(
-                     d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr);
+        if (vec && gath)
+            matmul_transposed_blocked_kernel<64, 64, 4, 4, true, kThreads, 2, true><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+        else if (vec)
+            matmul_transposed_blocked_kernel<64, 64, 4, 4, true><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
+        else if (gath)
+            matmul_transposed_blocked_kernel<64, 64, 4, 4, false, kThreads, 2, true><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, d_a_index);
+        else
+            matmul_transposed_blocked_kernel<64, 64, 4, 4, false><<<grid, block>>>(
+                d_a, d_b, d_c, 0, ki, ni, d_tiles, stride, nullptr, nullptr);
     }
     cuda_check(cudaGetLastError(), what);
 }
@@ -1950,13 +1994,13 @@ const GroupTile* upload_group_tiles(const GroupTile* host, std::size_t n) {
 void matmul_transposed_grouped(const float* d_a, const Tensor& weights,
                                std::size_t experts, float* d_c,
                                const GroupTile* d_tiles, std::size_t num_tiles,
-                               std::size_t block_m) {
+                               std::size_t block_m, const int* d_a_index) {
     if (!weights.device_data())
         throw std::runtime_error("matmul_transposed_grouped: weights not resident on device");
     const std::size_t k = weights.size(1);
     const std::size_t n = weights.size(0) / experts;
     launch_matmul_grouped(d_a, weights.device_data(), d_c, d_tiles, num_tiles, k, n,
-                          n * k, block_m, "matmul_transposed_grouped kernel");
+                          n * k, block_m, "matmul_transposed_grouped kernel", d_a_index);
 }
 
 void sliding_window_attention(const float* d_q, const float* d_k, const float* d_v,
